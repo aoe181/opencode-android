@@ -12,6 +12,7 @@ import dev.opencode.client.data.ChatMessage
 import dev.opencode.client.data.CommandInfo
 import dev.opencode.client.data.EventStream
 import dev.opencode.client.data.FileAttachment
+import dev.opencode.client.data.McpServerInfo
 import dev.opencode.client.data.ModelInfo
 import dev.opencode.client.data.ModelSelection
 import dev.opencode.client.data.OpenCodeApi
@@ -21,6 +22,9 @@ import dev.opencode.client.data.Tokens
 import dev.opencode.client.data.ToolCall
 import dev.opencode.client.data.deriveToolTitle
 import dev.opencode.client.data.extractMcpToolName
+import dev.opencode.client.data.extractMcpToolNameFromRaw
+import dev.opencode.client.data.inferToolNameFromInput
+import dev.opencode.client.data.parseToolInput
 import dev.opencode.client.data.joinContentText
 import dev.opencode.client.data.num
 import dev.opencode.client.data.parseFileChanges
@@ -68,6 +72,12 @@ data class ChatUiState(
     val serverDirectory: String? = null,
     // 待投递输入（agent 执行中发来的新输入）：inboxID -> 文本
     val pendingInputs: Map<String, String> = emptyMap(),
+    /** inboxID -> 投递方式（steer 插入 / queue 排队），长按面板据此显示切换文案。 */
+    val pendingDeliveries: Map<String, String> = emptyMap(),
+    /** MCP 服务器列表与连接状态（顶栏连接图标点开时加载）。 */
+    val mcpServers: List<McpServerInfo> = emptyList(),
+    /** 正在重连的 MCP 服务器名。 */
+    val reconnectingMcp: String? = null,
 )
 
 /**
@@ -507,6 +517,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     /** `/mcps`：展示 MCP 服务器连接状态（客户端本地渲染，不发给模型）。 */
     private suspend fun showMcps(s: RemoteServer): Result<Unit> {
         val servers = api.mcpServers(s).getOrNull()
+        _ui.update { it.copy(mcpServers = servers.orEmpty()) }
         val info = buildString {
             append("**MCP 服务器**\n\n")
             if (servers.isNullOrEmpty()) {
@@ -515,10 +526,47 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 servers.forEach { sv ->
                     append("- `").append(sv.name).append("` · ").append(sv.status ?: "unknown").append('\n')
                 }
+                append("\n点顶栏连接图标可重连失败的服务器。")
             }
         }
         appendLocalNotice(info)
         return Result.success(Unit)
+    }
+
+    /** 拉取 MCP 服务器状态（顶栏连接图标点开时调用）。 */
+    fun loadMcpServers() {
+        val s = server ?: return
+        viewModelScope.launch {
+            api.mcpServers(s).onSuccess { servers ->
+                _ui.update { it.copy(mcpServers = servers) }
+            }
+        }
+    }
+
+    /**
+     * 重连一个 MCP 服务器。
+     *
+     * 服务器端行为：MCP 若在 opencode 启动之后才起来，该目录的连接会一直停在 failed 不再重试，
+     * 于是 code mode 里没有这个服务器的工具，工具卡片只能显示 execute。手动触发 connect 即可恢复。
+     */
+    fun reconnectMcp(name: String) {
+        val s = server ?: return
+        val dir = _ui.value.serverDirectory
+        _ui.update { it.copy(reconnectingMcp = name) }
+        viewModelScope.launch {
+            val result = api.reconnectMcp(s, name, dir)
+            result
+                .onSuccess {
+                    _ui.update { it.copy(reconnectingMcp = null, error = null) }
+                    // 重连后刷新状态（status 会变成 connected）
+                    api.mcpServers(s).onSuccess { servers ->
+                        _ui.update { it.copy(mcpServers = servers) }
+                    }
+                }
+                .onFailure { e ->
+                    _ui.update { it.copy(reconnectingMcp = null, error = "重连 $name 失败：${e.message}") }
+                }
+        }
     }
 
     /** `/skills`：展示已加载的技能。 */
@@ -611,8 +659,12 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 val mid = data.str("assistantMessageID") ?: return
                 val ordinal = (data["ordinal"] as? JsonPrimitive)?.content?.toIntOrNull() ?: 0
                 val delta = data.str("delta") ?: return
-                val kind = if (event.type == "session.text.delta") "text" else "reasoning"
-                upsertBlock(mid, "t:$ordinal") { existing ->
+                val isReasoning = event.type == "session.reasoning.delta"
+                // 思考与正文的 ordinal 各自从 0 开始，必须用不同的 key 命名空间，
+                // 否则正文会覆盖思考块（表现为"思考完折叠块直接消失"，刷新后才又出现）
+                val key = if (isReasoning) "r:$ordinal" else "t:$ordinal"
+                val kind = if (isReasoning) "reasoning" else "text"
+                upsertBlock(mid, key) { existing ->
                     (existing as? Block.Text)?.copy(text = existing.text + delta)
                         ?: Block.Text(kind, delta, ordinal)
                 }
@@ -622,7 +674,10 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 val mid = data.str("assistantMessageID") ?: return
                 val ordinal = (data["ordinal"] as? JsonPrimitive)?.content?.toIntOrNull() ?: 0
                 val text = data.str("text") ?: return
-                upsertBlock(mid, "t:$ordinal") { Block.Text("text", text, ordinal) }
+                upsertBlock(mid, "t:$ordinal") { existing ->
+                    (existing as? Block.Text)?.copy(text = text, type = "text")
+                        ?: Block.Text("text", text, ordinal)
+                }
                 publish()
             }
             "session.tool.input.started" -> {
@@ -647,7 +702,23 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 val mid = data.str("assistantMessageID") ?: return
                 val callId = data.str("id") ?: return
                 val text = data.str("text") ?: return
-                upsertTool(mid, callId) { it.copy(input = text) }
+                // 输入完整到手：此时才能可靠解析出真实工具名（MCP 工具只在这时可见）
+                val declared = data.str("name")
+                val mcpTool = if (declared == "execute" || declared == null) {
+                    extractMcpToolNameFromRaw(text)
+                } else null
+                upsertTool(mid, callId) {
+                    it.copy(
+                        input = text,
+                        name = when {
+                            mcpTool != null -> "mcp"
+                            it.name == "tool" || it.name == "execute" ->
+                                inferToolNameFromInput(parseToolInput(text)) ?: it.name
+                            else -> it.name
+                        },
+                        title = mcpTool ?: it.title,
+                    )
+                }
                 publish()
             }
             "session.tool.called" -> {
@@ -655,10 +726,17 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 val callId = data.str("id") ?: return
                 val inputObj = data["input"] as? JsonObject
                 toolStart.putIfAbsent(callId, event.created ?: System.currentTimeMillis())
-                val mcpTool = if (data.str("name") == "execute") extractMcpToolName(inputObj) else null
+                val declared = data.str("name")
+                val mcpTool = if (declared == "execute") extractMcpToolName(inputObj) else null
                 upsertTool(mid, callId) {
                     it.copy(
-                        name = if (mcpTool != null) "mcp" else it.name,
+                        // 工具名必须在这里回写：input.started 事件偶尔不带 name，
+                        // 不补就会一直显示占位名 "tool"，直到历史刷新才变回 edit/write
+                        name = when {
+                            mcpTool != null -> "mcp"
+                            declared != null && declared != "tool" -> declared
+                            else -> inferToolNameFromInput(inputObj) ?: it.name
+                        },
                         input = inputObj?.toString() ?: it.input,
                         title = mcpTool ?: deriveToolTitle(inputObj) ?: it.title,
                         // 真实开始执行：覆盖此前的 running 占位状态
@@ -719,13 +797,15 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 // 服务器常见：思考部件只有空白内容（" "）。此时不落地任何块，
                 // 避免出现"展开了却是空的"折叠框（Web 端同样不显示）
                 if (text != null && text.isBlank()) {
-                    liveBlocks[mid]?.remove("t:$ordinal")
+                    liveBlocks[mid]?.remove("r:$ordinal")
                     publish()
                     return
                 }
-                upsertBlock(mid, "t:$ordinal") { existing ->
+                // 思考结束：按 reasoning 命名空间更新，保留 started 记录的耗时
+                upsertBlock(mid, "r:$ordinal") { existing ->
                     (existing as? Block.Text)?.copy(
                         text = text?.takeIf { it.isNotBlank() } ?: existing.text,
+                        type = "reasoning",
                         durationMs = duration ?: existing.durationMs,
                     ) ?: Block.Text("reasoning", text.orEmpty(), ordinal, duration)
                 }
@@ -956,7 +1036,12 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         }
         _ui.update {
             // distinctBy 兜底：任何来源的重复 id 都不允许进列表（LazyColumn key 崩溃防护）
-            it.copy(messages = (history + live + pending).distinctBy { m -> m.id })
+            it.copy(
+                messages = (history + live + pending).distinctBy { m -> m.id },
+                // 让长按面板能识别"尚未投递"的输入，从而提供撤回/插队
+                pendingInputs = pendingUser.toMap(),
+                pendingDeliveries = pendingDelivery.toMap(),
+            )
         }
     }
 

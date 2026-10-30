@@ -292,18 +292,72 @@ private fun parseToolPart(obj: JsonObject, index: Int, shellResults: Map<String,
 }
 
 /**
- * 从 execute 工具的 input.code 中提取真实 MCP 工具名。
- * 形如：tools["local-mcp"].mt_apk_list_available_apks({...})  →  local-mcp · mt_apk_list_available_apks
+ * 从 execute 工具的 input.code 中提取真实工具名。
+ *
+ * 卡片头部已经用 "mcp" 徽标标明来源，服务器名（local-mcp）对使用者没有意义，只显示工具名。
+ * 支持两种写法：
+ *   tools["local-mcp"].mt_apk_list_available_apks({...})
+ *   tools["local-mcp"]["mt_apk_list_available_apks"]({...})
+ * 也支持内置 code mode 工具：tools.opencode.list_mcp_resources({...})
  */
 internal fun extractMcpToolName(input: JsonObject?): String? {
     val code = input?.str("code") ?: return null
-    val m = MCP_TOOL_REGEX.find(code) ?: return null
-    return m.groupValues[1] + " · " + m.groupValues[2]
+    MCP_TOOL_BRACKET_REGEX.find(code)?.let { return it.groupValues[2] }
+    MCP_TOOL_DOT_REGEX.find(code)?.let { return it.groupValues[1] }
+    MCP_BUILTIN_DOT_REGEX.find(code)?.let { return it.groupValues[1] }
+    return null
 }
 
-/** tools["server"].toolName(...) —— 从 code mode 代码里取真实 MCP 工具。 */
-private val MCP_TOOL_REGEX =
+/**
+ * 从**原始 JSON 字符串**形式的工具输入里提取 MCP 工具名。
+ *
+ * 实时事件（session.tool.called / input.ended）送来的 input 是 JSON 文本，
+ * 里面 `tools[\"local-mcp\"]` 的引号是转义的，直接跑正则会失配——所以先解析成 JsonObject。
+ * 历史消息路径拿到的本来就是 JsonObject，走 [extractMcpToolName]。
+ */
+internal fun extractMcpToolNameFromRaw(raw: String?): String? {
+    val obj = parseToolInput(raw) ?: return null
+    return extractMcpToolName(obj)
+}
+
+/** 宽松解析工具输入 JSON（流式分片可能不完整，失败返回 null）。 */
+internal fun parseToolInput(raw: String?): JsonObject? {
+    if (raw.isNullOrBlank()) return null
+    return runCatching { lenientJson.parseToJsonElement(raw) as? JsonObject }.getOrNull()
+}
+
+/**
+ * 从工具输入参数推断工具名。
+ *
+ * 实时事件里 session.tool.input.started 偶尔不带 name，占位名会一直停留在 "tool"，
+ * 直到历史刷新才变回 edit/write——用户看到的就是"标签先显示 tool，过一会才变"。
+ * 这里按输入参数特征做保底推断，让标签在流式阶段就正确。
+ */
+internal fun inferToolNameFromInput(input: JsonObject?): String? {
+    if (input == null) return null
+    return when {
+        input.containsKey("code") -> "execute"
+        input.containsKey("oldString") || input.containsKey("newString") ||
+            input.containsKey("patch") -> "edit"
+        input.containsKey("content") && input.containsKey("path") -> "write"
+        input.containsKey("command") -> "shell"
+        input.containsKey("pattern") -> "grep"
+        input.containsKey("filePath") || (input.containsKey("path") && input.containsKey("offset")) -> "read"
+        else -> null
+    }
+}
+
+/** tools["server"].toolName(...) */
+private val MCP_TOOL_DOT_REGEX =
     Regex("tools\\[\\s*[\"']([^\"']+)[\"']\\s*\\]\\s*\\.\\s*([A-Za-z0-9_]+)")
+
+/** tools["server"]["toolName"](...) */
+private val MCP_TOOL_BRACKET_REGEX =
+    Regex("tools\\[\\s*[\"']([^\"']+)[\"']\\s*\\]\\s*\\[\\s*[\"']([A-Za-z0-9_]+)[\"']\\s*\\]")
+
+/** tools.opencode.toolName(...) —— code mode 内置工具 */
+private val MCP_BUILTIN_DOT_REGEX =
+    Regex("tools\\.opencode\\.([A-Za-z0-9_]+)")
 
 /** 解析 GET /api/session/{id}/message 响应。
  * user 消息文本在顶层 text 字段（payload.text 是 prompt 响应形状，作兜底），

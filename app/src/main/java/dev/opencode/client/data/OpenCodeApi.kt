@@ -1,5 +1,6 @@
 package dev.opencode.client.data
 
+import android.net.Uri
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
@@ -246,6 +247,37 @@ class OpenCodeApi {
     /** MCP 服务器列表（/api/mcp）。 */
     suspend fun mcpServers(server: RemoteServer): Result<List<McpServerInfo>> =
         get(server, "/api/mcp").mapCatching(::parseMcpServers)
+
+    /**
+     * 运行时重连一个 MCP 服务器。
+     *
+     * 背景：若 MCP 服务在 opencode 启动之后才起来，该工作目录的连接会一直停留在 failed
+     * 状态不再自动重试，导致 code mode 里根本没有这个服务器的工具（只能看到 execute）。
+     * 对应接口 POST /api/experimental/mcp/{server}/connect?location[directory]=<dir>
+     */
+    suspend fun reconnectMcp(
+        server: RemoteServer,
+        name: String,
+        directory: String?,
+    ): Result<Unit> {
+        val path = buildString {
+            append("/api/experimental/mcp/")
+            append(Uri.encode(name))
+            append("/connect")
+            if (!directory.isNullOrBlank()) {
+                append("?location[directory]=")
+                append(Uri.encode(directory))
+            }
+        }
+        return withContext(Dispatchers.IO) {
+            runCatching {
+                val req = request(server, path).post(ByteArray(0).toRequestBody(null)).build()
+                client.newCall(req).execute().use { resp ->
+                    if (!resp.isSuccessful) error("HTTP ${resp.code}")
+                }
+            }
+        }
+    }
 
     /** 技能列表（/api/skill）。 */
     suspend fun skills(server: RemoteServer): Result<List<SkillInfo>> =

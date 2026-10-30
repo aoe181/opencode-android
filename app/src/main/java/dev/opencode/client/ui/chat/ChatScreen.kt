@@ -113,6 +113,7 @@ fun ChatScreen(mainVm: MainViewModel) {
     var actionMessage by remember { mutableStateOf<ChatMessage?>(null) }
     val scope = rememberCoroutineScope()
     var showSessionSwitcher by remember { mutableStateOf(false) }
+    var showMcpPanel by remember { mutableStateOf(false) }
 
     val pickFile = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
         if (uri != null) chatVm.onPicked(uri)
@@ -215,27 +216,46 @@ fun ChatScreen(mainVm: MainViewModel) {
                         }
                     }
                 }
-                // 连接状态：绿色对号 / 橙色圈（重连中） / 红色叉
+                // 连接状态：绿色对号 / 橙色圈（重连中） / 红色叉；点开可查看并重连 MCP
                 val connColor = when (state.connectionState) {
                     "connected" -> Color(0xFF4ADE80)
                     "reconnecting" -> Color(0xFFFFA726)
                     else -> Color(0xFFFF5C7A)
                 }
-                Box(
-                    modifier = Modifier
-                        .size(14.dp)
-                        .padding(end = 2.dp),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Text(
-                        text = when (state.connectionState) {
-                            "connected" -> "✓"
-                            "reconnecting" -> "○"
-                            else -> "✕"
-                        },
-                        style = MaterialTheme.typography.labelMedium,
-                        color = connColor
-                    )
+                Box {
+                    Box(
+                        modifier = Modifier
+                            .size(30.dp)
+                            .clickable {
+                                if (showMcpPanel) showMcpPanel = false
+                                else {
+                                    chatVm.loadMcpServers()
+                                    showMcpPanel = true
+                                }
+                            },
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text(
+                            text = when (state.connectionState) {
+                                "connected" -> "✓"
+                                "reconnecting" -> "○"
+                                else -> "✕"
+                            },
+                            style = MaterialTheme.typography.labelMedium,
+                            color = connColor
+                        )
+                    }
+                    DropdownMenu(
+                        expanded = showMcpPanel,
+                        onDismissRequest = { showMcpPanel = false }
+                    ) {
+                        McpPanel(
+                            servers = state.mcpServers,
+                            reconnecting = state.reconnectingMcp,
+                            onReconnect = { chatVm.reconnectMcp(it) },
+                            onRefresh = { chatVm.loadMcpServers() },
+                        )
+                    }
                 }
             }
         }
@@ -253,7 +273,12 @@ fun ChatScreen(mainVm: MainViewModel) {
                 verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 items(state.messages, key = { it.id }) { message ->
-                    MessageBubble(message = message, onLongPress = { actionMessage = message })
+                    MessageBubble(
+                        message = message,
+                        onLongPress = { actionMessage = message },
+                        // 只有正在流式增长的最后一条 assistant 消息才降级表格渲染
+                        streaming = state.streaming && message.id == state.messages.lastOrNull()?.id,
+                    )
                 }
                 if (state.streaming && state.messages.lastOrNull()?.role != "assistant") {
                     item(key = "thinking") {
@@ -749,7 +774,7 @@ fun ChatScreen(mainVm: MainViewModel) {
                         actionMessage = null
                     }
                     SheetAction(
-                        if (state.pendingInputs[message.id] == "queue") {
+                        if (state.pendingDeliveries[message.id] == "queue") {
                             "改为插入（下一步立即送达）"
                         } else {
                             "改为排队（当前执行完再送达）"
@@ -762,6 +787,83 @@ fun ChatScreen(mainVm: MainViewModel) {
             }
         }
     }
+}
+
+/**
+ * MCP 服务器面板：展示连接状态，并提供手动重连。
+ *
+ * 为什么需要手动重连：MCP 服务若在 opencode 启动之后才起来，服务器会把这个目录的连接
+ * 标记为 failed 且不再自动重试，code mode 里就取不到该服务器的工具。
+ */
+@Composable
+private fun McpPanel(
+    servers: List<dev.opencode.client.data.McpServerInfo>,
+    reconnecting: String?,
+    onReconnect: (String) -> Unit,
+    onRefresh: () -> Unit,
+) {
+    Text(
+        text = "MCP 服务器",
+        style = MaterialTheme.typography.labelMedium,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        modifier = Modifier.padding(horizontal = 14.dp, vertical = 6.dp)
+    )
+    if (servers.isEmpty()) {
+        Text(
+            text = "未配置或尚未加载",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(horizontal = 14.dp, vertical = 4.dp)
+        )
+    }
+    servers.forEach { sv ->
+        val connected = sv.status == "connected"
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 14.dp, vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                text = if (connected) "✓" else "✕",
+                style = MaterialTheme.typography.labelMedium,
+                color = if (connected) Color(0xFF4ADE80) else Color(0xFFFF5C7A)
+            )
+            Spacer(Modifier.width(8.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = sv.name,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurface
+                )
+                Text(
+                    text = sv.status ?: "unknown",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+            if (reconnecting == sv.name) {
+                CircularProgressIndicator(modifier = Modifier.size(14.dp), strokeWidth = 2.dp)
+            } else {
+                Text(
+                    text = if (connected) "重连" else "连接",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier
+                        .clickable { onReconnect(sv.name) }
+                        .padding(horizontal = 8.dp, vertical = 4.dp)
+                )
+            }
+        }
+    }
+    Text(
+        text = "刷新状态",
+        style = MaterialTheme.typography.labelSmall,
+        color = MaterialTheme.colorScheme.primary,
+        modifier = Modifier
+            .clickable { onRefresh() }
+            .padding(horizontal = 14.dp, vertical = 8.dp)
+    )
 }
 
 /** 紧凑选择 chip：撑满父容器宽度、文字居中（weight 由外层 Box 承担）。 */
@@ -914,7 +1016,11 @@ private fun CommandHint(commands: List<CommandInfo>, onPick: (String) -> Unit) {
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun MessageBubble(message: ChatMessage, onLongPress: () -> Unit) {
+private fun MessageBubble(
+    message: ChatMessage,
+    onLongPress: () -> Unit,
+    streaming: Boolean = false,
+) {
     if (message.role == "user") {
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -983,7 +1089,8 @@ private fun MessageBubble(message: ChatMessage, onLongPress: () -> Unit) {
                         "reasoning" -> ReasoningBlock(message.id, block.ordinal, block.text, block.durationMs)
                         else -> MarkdownText(
                             markdown = block.text,
-                            modifier = Modifier.fillMaxWidth()
+                            modifier = Modifier.fillMaxWidth(),
+                            streaming = streaming,
                         )
                     }
                     is Block.Tool -> ToolCallCard(block.call)

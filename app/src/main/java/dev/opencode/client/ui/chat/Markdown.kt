@@ -24,36 +24,17 @@ fun MarkdownText(
     markdown: String,
     modifier: Modifier = Modifier,
     color: Color = MaterialTheme.colorScheme.onSurface,
+    /** 该块是否仍在流式增长。为 true 时表格按纯文本渲染，避免列宽反复重算导致的闪屏。 */
+    streaming: Boolean = false,
 ) {
     val context = LocalContext.current
     val dark = LocalAppDarkTheme.current
-    val markwon = remember(context, dark) {
-        val borderColor = if (dark) 0xFF2C3340.toInt() else 0xFFCBD3E1.toInt()
-        Markwon.builder(context)
-            .usePlugin(CorePlugin.create())
-            .usePlugin(
-                TablePlugin.create { builder ->
-                    builder
-                        .tableBorderColor(borderColor)
-                        .tableBorderWidth(2)
-                        .tableCellPadding(8)
-                        .tableEvenRowBackgroundColor(if (dark) 0xFF14171F.toInt() else 0xFFF7F8FB.toInt())
-                        .tableOddRowBackgroundColor(if (dark) 0xFF1A1E28.toInt() else 0xFFEAEDF4.toInt())
-                        .tableHeaderRowBackgroundColor(if (dark) 0xFF11141B.toInt() else 0xFFFFFFFF.toInt())
-                }
-            )
-            .usePlugin(object : AbstractMarkwonPlugin() {
-                override fun configureTheme(builder: MarkwonTheme.Builder) {
-                    builder
-                        .codeTextColor(0xFFBD93F9.toInt())
-                        .codeBackgroundColor(if (dark) 0xFF2A2A32.toInt() else 0xFFECEEF2.toInt())
-                        .codeBlockBackgroundColor(if (dark) 0xFF17181D.toInt() else 0xFFF4F5F7.toInt())
-                        .linkColor(0xFF42A5F5.toInt())
-                        .isLinkUnderlined(true)
-                }
-            })
-            .build()
-    }
+    val markwon = remember(context, dark) { buildMarkwon(context, dark, withTables = true) }
+    // 流式期间禁用表格插件：TablePlugin 每次都要重算列宽/单元格背景，
+    // 文本每增长一行就整表重排，视觉上就是"闪"。降级为纯文本后列宽不再变化。
+    val markwonNoTables = remember(context, dark) { buildMarkwon(context, dark, withTables = false) }
+    val hasTable = remember(markdown) { looksLikeTable(markdown) }
+    val usePlain = streaming && hasTable
     AndroidView(
         modifier = modifier,
         factory = { ctx ->
@@ -66,13 +47,64 @@ fun MarkdownText(
         },
         update = { tv ->
             tv.setTextColor(color.toArgb())
-            markwon.setMarkdown(tv, markdown)
+            val renderer = if (usePlain) markwonNoTables else markwon
+            renderer.setMarkdown(tv, markdown)
             // 语法染色是纯 CPU 遍历，流式时文本增长很快；长文本降频以免抢主线程帧时间
             if (markdown.length <= HIGHLIGHT_SYNC_LIMIT || markdown.endsWith("```")) {
                 Highlighter.apply(tv)
             }
         }
     )
+}
+
+/** 构造 Markwon；withTables=false 时不装表格插件（流式降级用）。 */
+private fun buildMarkwon(
+    context: android.content.Context,
+    dark: Boolean,
+    withTables: Boolean,
+): Markwon {
+    val borderColor = if (dark) 0xFF2C3340.toInt() else 0xFFCBD3E1.toInt()
+    val builder = Markwon.builder(context)
+        .usePlugin(CorePlugin.create())
+    if (withTables) {
+        builder.usePlugin(
+            TablePlugin.create { b ->
+                b
+                    .tableBorderColor(borderColor)
+                    .tableBorderWidth(2)
+                    .tableCellPadding(8)
+                    .tableEvenRowBackgroundColor(if (dark) 0xFF14171F.toInt() else 0xFFF7F8FB.toInt())
+                    .tableOddRowBackgroundColor(if (dark) 0xFF1A1E28.toInt() else 0xFFEAEDF4.toInt())
+                    .tableHeaderRowBackgroundColor(if (dark) 0xFF11141B.toInt() else 0xFFFFFFFF.toInt())
+            }
+        )
+    }
+    builder.usePlugin(object : AbstractMarkwonPlugin() {
+        override fun configureTheme(b: MarkwonTheme.Builder) {
+            b
+                .codeTextColor(0xFFBD93F9.toInt())
+                .codeBackgroundColor(if (dark) 0xFF2A2A32.toInt() else 0xFFECEEF2.toInt())
+                .codeBlockBackgroundColor(if (dark) 0xFF17181D.toInt() else 0xFFF4F5F7.toInt())
+                .linkColor(0xFF42A5F5.toInt())
+                .isLinkUnderlined(true)
+        }
+    })
+    return builder.build()
+}
+
+/**
+ * 粗判是否含 Markdown 表格：存在一行含至少两个 `|`，
+ * 且下一行（或上一行）是 `|---|` 这类分隔行。
+ */
+private fun looksLikeTable(markdown: String): Boolean {
+    if (markdown.indexOf('|') < 0) return false
+    val lines = markdown.lines()
+    for (i in lines.indices) {
+        if (lines[i].count { it == '|' } < 2) continue
+        val next = lines.getOrNull(i + 1) ?: continue
+        if (next.contains('-') && next.count { it == '|' } >= 2) return true
+    }
+    return false
 }
 
 /** 超过该长度时，只在代码块闭合（``` 结尾）才重新染色，避免流式期间每帧全量扫描。 */
