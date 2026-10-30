@@ -6,22 +6,18 @@ import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import okhttp3.Credentials
-import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
 import okhttp3.sse.EventSource
 import okhttp3.sse.EventSourceListener
 import okhttp3.sse.EventSources
 import java.io.IOException
-import java.util.concurrent.TimeUnit
 
 /** 订阅 GET /api/event 的 SSE 事件流。 */
 class EventStream(private val server: RemoteServer) {
 
-    private val client = OkHttpClient.Builder()
-        // 流式读取不设超时，服务器周期性发 heartbeat
-        .readTimeout(0, TimeUnit.SECONDS)
-        .build()
+    // 派生自共享 client：复用连接池/线程池，仅把读超时放开（SSE 长连接）
+    private val client = HttpClients.streaming
 
     private val json = Json { ignoreUnknownKeys = true }
 

@@ -10,10 +10,8 @@ import kotlinx.serialization.json.JsonPrimitive
 import okhttp3.Credentials
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
-import java.util.concurrent.TimeUnit
 
 /** 一台 opencode serve 服务器：基地址 + 可选的 Basic Auth 密码。 */
 data class RemoteServer(
@@ -57,10 +55,8 @@ data class SessionSummary(
  */
 class OpenCodeApi {
 
-    private val client = OkHttpClient.Builder()
-        .connectTimeout(5, TimeUnit.SECONDS)
-        .readTimeout(30, TimeUnit.SECONDS)
-        .build()
+    // 共享连接池，避免与 EventStream 各建一套
+    private val client = HttpClients.shared
 
     private val json = Json { ignoreUnknownKeys = true }
 

@@ -14,6 +14,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 data class MainUiState(
@@ -46,41 +48,72 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     private val _selected = MutableStateFlow<Pair<String, String>?>(null)
     val selected: StateFlow<Pair<String, String>?> = _selected.asStateFlow()
 
-    /** 各会话的输入框草稿缓存：sessionID -> 文本（切对话不丢）。 */
+    /** 各会话的输入框草稿缓存：sessionID -> 文本（切对话不丢，持久化）。 */
     private val _drafts = MutableStateFlow<Map<String, String>>(emptyMap())
     val drafts: StateFlow<Map<String, String>> = _drafts.asStateFlow()
 
-    fun saveDraft(sessionID: String, text: String) {
-        _drafts.update { it + (sessionID to text) }
+    /** 各会话上次浏览到的消息索引（持久化）。 */
+    private val _scrollPositions = mutableMapOf<String, Int>()
+
+    /** 会话本地状态（草稿+滚动）批量落盘防抖。 */
+    private var persistJob: Job? = null
+
+    private fun persistSessionLocal(immediate: Boolean = false) {
+        persistJob?.cancel()
+        persistJob = viewModelScope.launch {
+            if (!immediate) delay(500) // 输入时防抖，避免每次按键都写盘
+            settings.saveSessionLocal(
+                dev.opencode.client.data.SessionLocalState(
+                    drafts = _drafts.value,
+                    scrolls = _scrollPositions.toMap(),
+                )
+            )
+        }
     }
 
-    /** 各会话上次浏览到的消息索引（切对话回来恢复位置）。 */
-    private val _scrollPositions = mutableMapOf<String, Int>()
+    fun saveDraft(sessionID: String, text: String) {
+        _drafts.update { it + (sessionID to text) }
+        persistSessionLocal()
+    }
 
     fun saveScrollPosition(sessionID: String, index: Int) {
         _scrollPositions[sessionID] = index
+        persistSessionLocal()
     }
 
     fun scrollPosition(sessionID: String): Int? = _scrollPositions[sessionID]
 
     fun openSession(id: String, title: String) {
         _selected.value = id to title
+        viewModelScope.launch { settings.saveLastSession(id, title) }
     }
 
     fun closeSession() {
         _selected.value = null
+        viewModelScope.launch { settings.clearLastSession() }
         refresh()
     }
 
     init {
         viewModelScope.launch {
-            // 启动加速：先并行取「已保存的服务器」与「主题设置」，
-            // 拿到地址后 info + sessions 也已并行（见 verify），整体冷启动更快
+            // 启动加速：并行读取「服务器」「会话本地状态」「首屏会话缓存」
             val saved = settings.load()
+            val local = settings.loadSessionLocal()
+            _drafts.value = local.drafts
+            _scrollPositions.putAll(local.scrolls)
+            // 首屏缓存：先把上次的会话列表显示出来（网络返回后替换）
+            val cached = settings.loadSessionsCache()
+            if (cached.isNotEmpty()) {
+                _uiState.update { it.copy(sessions = cached) }
+            }
             if (saved != null) {
                 // 立即进入"正在连接"过渡态，UI 不等网络
                 _uiState.update { it.copy(server = saved, loading = true, restoring = true) }
                 verify(saved)
+                // 自动恢复上次打开的会话
+                settings.loadLastSession()?.let { (id, title) ->
+                    if (id.isNotBlank()) _selected.value = id to title
+                }
             }
         }
     }
@@ -158,10 +191,19 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    fun createSession() {        val server = _uiState.value.server ?: return
+    fun createSession() {
+        val server = _uiState.value.server ?: return
         viewModelScope.launch {
             api.createSession(server)
                 .onSuccess { id ->
+                    // 新会话套用上次选择的模型/档位（服务器默认可能不是用户想要的）
+                    val defaults = settings.loadDefaults()
+                    if (defaults.providerID != null && defaults.modelID != null) {
+                        api.setModel(server, id, defaults.providerID, defaults.modelID, defaults.variant)
+                    }
+                    if (defaults.agent != null) {
+                        api.setAgent(server, id, defaults.agent)
+                    }
                     refresh()
                     openSession(id, "新会话")
                 }
@@ -200,6 +242,10 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                             sessions = sessions,
                             sessionsCursor = cursor,
                         )
+                    }
+                    // 缓存首屏列表，下次启动立即显示
+                    if (sessions.isNotEmpty()) {
+                        settings.saveSessionsCache(sessions)
                     }
                 }
                 .onFailure { e ->

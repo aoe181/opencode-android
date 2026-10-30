@@ -557,8 +557,18 @@ fun ChatScreen(mainVm: MainViewModel) {
                                                 text = model.name ?: displayModelId(model.modelID),
                                                 style = MaterialTheme.typography.bodyMedium
                                             )
+                                            // 上下文规格：与 TUI/Web 一致，取 model.limit.context / output
                                             Text(
-                                                text = model.providerID,
+                                                text = buildString {
+                                                    append("   ") // 缩进
+                                                    append(model.providerID)
+                                                    model.contextLimit?.let {
+                                                        append("  ·  输入 ").append(formatTokens(it))
+                                                    }
+                                                    model.outputLimit?.let {
+                                                        append(" · 输出 ").append(formatTokens(it))
+                                                    }
+                                                },
                                                 style = MaterialTheme.typography.labelSmall,
                                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                                             )

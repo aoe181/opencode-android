@@ -76,6 +76,7 @@ data class ChatUiState(
 class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     private val api = OpenCodeApi()
+    private val settings = dev.opencode.client.data.SettingsStore(app)
     private var server: RemoteServer? = null
     private var sessionID: String? = null
     private var streamJob: Job? = null
@@ -258,6 +259,15 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                         }
                     }
                     applyDetail(detail)
+                    // 记住该模型/档位，下次新建会话沿用
+                    settings.saveDefaults(
+                        dev.opencode.client.data.SettingsStore.Defaults(
+                            providerID = providerID,
+                            modelID = modelID,
+                            variant = variant,
+                            agent = _ui.value.currentAgent,
+                        )
+                    )
                 }
                 .onFailure { e ->
                     _ui.update { it.copy(error = "切换模型失败：${e.message}") }
@@ -905,7 +915,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
      * 历史 + 正在流式生成的合成消息 + 待投递输入，合并为 UI 列表。
      *
      * 流式期间 delta 事件非常密集（一次回复可达数百次），每次都全量重建 UI 列表会让
-     * Compose 反复重排、Markwon 反复解析 Markdown。这里做 16ms（≈60fps）合并刷新：
+     * Compose 反复重排、Markwon 反复解析 Markdown。这里做 32ms（≈30fps）合并刷新：
      * 状态照常累积，只限制 UI 刷新频率；非流式时立即刷新保证交互即时。
      */
     private fun publish() {
@@ -913,7 +923,9 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             if (publishScheduled) return
             publishScheduled = true
             viewModelScope.launch {
-                kotlinx.coroutines.delay(16)
+                // 32ms（约 30fps）：流式期间 Markdown/表格重解析开销大，
+                // 提高间隔可显著减轻表格抖动与闪烁
+                kotlinx.coroutines.delay(32)
                 publishScheduled = false
                 publishNow()
             }

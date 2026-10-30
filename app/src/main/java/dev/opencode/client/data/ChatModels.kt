@@ -127,6 +127,7 @@ data class ModelInfo(
     val name: String?,
     val variants: List<String>,
     val contextLimit: Long? = null,
+    val outputLimit: Long? = null,
     val inputTypes: List<String> = emptyList(),
 ) {
     /** 与会话当前模型（composite id，如 "loomy/GLM-5.3-Flash"）匹配。 */
@@ -506,6 +507,8 @@ fun parseModels(body: String): List<ModelInfo> = parseDataArray(body) { obj ->
             ?.mapNotNull { v -> (v as? JsonObject)?.str("id") }
             .orEmpty(),
         contextLimit = ((obj["limit"] as? JsonObject)?.get("context") as? JsonPrimitive)
+            ?.content?.toLongOrNull(),
+        outputLimit = ((obj["limit"] as? JsonObject)?.get("output") as? JsonPrimitive)
             ?.content?.toLongOrNull(),
         inputTypes = ((obj["capabilities"] as? JsonObject)?.get("input") as? JsonArray)
             ?.mapNotNull { v -> (v as? JsonPrimitive)?.takeIf { it.isString }?.content }

@@ -12,8 +12,8 @@ android {
         applicationId = "dev.opencode.client"
         minSdk = 26
         targetSdk = 36
-        versionCode = 2
-        versionName = "0.2.0-pre"
+        versionCode = 3
+        versionName = "0.3.0-pre"
         ndk {
             // 只出 64 位包
             abiFilters.add("arm64-v8a")
