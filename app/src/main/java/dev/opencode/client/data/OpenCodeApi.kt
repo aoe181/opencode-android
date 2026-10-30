@@ -261,14 +261,21 @@ class OpenCodeApi {
     suspend fun pendingForms(server: RemoteServer, sessionID: String): Result<List<FormDetail>> =
         get(server, "/api/session/$sessionID/form").mapCatching(::parseForms)
 
-    /** 回答表单：key -> 值（选项 label 或自由文本）。 */
+    /** 回答表单：key -> 值（字符串 / 多选数组 / 布尔 / 数字，与服务器 Form.Value 一致）。 */
     suspend fun replyForm(
         server: RemoteServer,
         sessionID: String,
         formID: String,
-        answer: Map<String, String>,
+        answer: Map<String, FormValue>,
     ): Result<Unit> {
-        val answerObj = JsonObject(answer.mapValues { JsonPrimitive(it.value) })
+        val answerObj = JsonObject(answer.mapValues { (_, v) ->
+            when (v) {
+                is FormValue.Text -> JsonPrimitive(v.value)
+                is FormValue.Multi -> JsonArray(v.values.map { JsonPrimitive(it) })
+                is FormValue.Flag -> JsonPrimitive(v.value)
+                is FormValue.Num -> JsonPrimitive(v.value)
+            }
+        })
         val body = JsonObject(mapOf("answer" to answerObj)).toString()
         return post(server, "/api/session/$sessionID/form/$formID/reply", body).map { }
     }

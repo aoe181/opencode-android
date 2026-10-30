@@ -701,56 +701,105 @@ data class PendingInboxItem(
     val delivery: String,
 )
 
-fun parseForms(body: String): List<FormDetail> = parseDataArray(body) { obj ->
+/**
+ * 解析单个表单对象（`GET /api/session/{id}/form` 的数组元素，
+ * 或 SSE `form.created` 事件里的 `data.form`）。
+ *
+ * 字段类型见服务器 Form.Field：string / multiselect / boolean / number /
+ * integer / external。question 工具只产生 string 与 multiselect，
+ * 其余类型（MCP elicitation）也一并支持，避免提交时被判为非法答案。
+ */
+fun parseFormObject(obj: JsonObject): FormDetail? {
     val fields = (obj["fields"] as? JsonArray)?.mapNotNull { f ->
         val fo = f as? JsonObject ?: return@mapNotNull null
         val key = fo.str("key") ?: return@mapNotNull null
+        val defaults = when (val d = fo["default"]) {
+            is JsonArray -> d.mapNotNull { (it as? JsonPrimitive)?.content }
+            is JsonPrimitive -> listOfNotNull(d.takeIf { it.isString }?.content)
+            else -> emptyList()
+        }
         FormFieldInfo(
             key = key,
-            title = fo.str("title"),
             type = fo.str("type") ?: "string",
+            title = fo.str("title"),
+            description = fo.str("description"),
+            placeholder = fo.str("placeholder"),
             options = ((fo["options"] as? JsonArray)?.mapNotNull { o ->
                 (o as? JsonObject)?.let {
+                    val value = it.str("value") ?: it.str("label") ?: ""
                     FormOption(
-                        value = it.str("value") ?: "",
-                        label = it.str("label") ?: "",
+                        value = value,
+                        label = it.str("label") ?: value,
                         description = it.str("description"),
                     )
                 }
             } ?: emptyList()),
             custom = (fo["custom"] as? JsonPrimitive)?.content == "true",
+            required = (fo["required"] as? JsonPrimitive)?.content == "true",
+            hidden = (fo["hidden"] as? JsonPrimitive)?.content == "true",
+            minItems = fo.num("minItems")?.toInt() ?: 0,
+            maxItems = fo.num("maxItems")?.toInt() ?: 0,
+            default = defaults,
         )
     } ?: emptyList()
-    if (fields.isEmpty()) return@parseDataArray null
-    FormDetail(
-        id = obj.str("id") ?: return@parseDataArray null,
+    if (fields.isEmpty()) return null
+    return FormDetail(
+        id = obj.str("id") ?: return null,
         sessionID = obj.str("sessionID") ?: "",
         title = obj.str("title") ?: "Question",
+        kind = (obj["metadata"] as? JsonObject)?.str("kind"),
         fields = fields,
     )
 }
+
+fun parseForms(body: String): List<FormDetail> = parseDataArray(body) { parseFormObject(it) }
 
 /** 待回答表单（question 工具创建）。 */
 data class FormDetail(
     val id: String,
     val sessionID: String,
     val title: String,
+    /** metadata.kind：question / websearch.provider / mcp-elicitation … */
+    val kind: String? = null,
     val fields: List<FormFieldInfo>,
 )
 
 data class FormFieldInfo(
     val key: String,
-    val title: String?,
     val type: String,
-    val options: List<FormOption>,
-    val custom: Boolean,
-)
+    val title: String? = null,
+    val description: String? = null,
+    val placeholder: String? = null,
+    val options: List<FormOption> = emptyList(),
+    val custom: Boolean = false,
+    val required: Boolean = false,
+    val hidden: Boolean = false,
+    val minItems: Int = 0,
+    val maxItems: Int = 0,
+    val default: List<String> = emptyList(),
+) {
+    /** 多选（服务器 Form.MultiselectField）。 */
+    val multiple: Boolean get() = type == "multiselect"
+}
 
 data class FormOption(
     val value: String,
     val label: String,
     val description: String? = null,
 )
+
+/**
+ * 提交值，与服务器 Form.Value 对应：
+ * 字符串 / 字符串数组（多选）/ 布尔 / 数字。
+ *
+ * 必须区分类型：多选字段提交字符串会被服务器判为 FormInvalidAnswerError。
+ */
+sealed interface FormValue {
+    data class Text(val value: String) : FormValue
+    data class Multi(val values: List<String>) : FormValue
+    data class Flag(val value: Boolean) : FormValue
+    data class Num(val value: Double) : FormValue
+}
 
 fun parseInboxItems(body: String): List<PendingInboxItem> = parseDataArray(body) { obj ->
     // 只关心用户输入项；synthetic/compaction/move 等系统项忽略

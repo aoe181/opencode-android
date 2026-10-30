@@ -36,6 +36,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
@@ -47,6 +48,7 @@ import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.Button
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.DropdownMenu
@@ -59,6 +61,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -80,6 +83,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -887,31 +891,90 @@ fun ChatScreen(mainVm: MainViewModel) {
 }
 
 /**
- * question 表单卡片：agent 向用户提问，选项单选或自由输入（Web 同款）。
+ * question 表单卡片：与 Web 的 question dock 对齐。
  *
- * 协议：表单由 question 工具创建（GET /api/session/{id}/form 列出），
- * 回答 POST .../form/{formID}/reply，body {"answer": {fieldKey: value}}，
- * 值用选项 label 或自由文本（服务器把 label 原样作为回答返回给模型）。
+ * 协议（服务器 Form 契约，见 /openapi.json 的 Form.* schema）：
+ * - 表单由 question 工具创建，SSE `form.created` 事件带完整表单，立即弹出；
+ * - 字段类型：string（单选 + 可自定义）/ multiselect（多选 + 可自定义）/
+ *   boolean / number / integer；
+ * - 回答 POST .../form/{formID}/reply，body {"answer": {fieldKey: value}}；
+ *   单选提交选项的 value（字符串），多选提交 value 数组，
+ *   自定义输入按原始文本追加（多选时并入数组）。
  */
 @Composable
 private fun QuestionFormCard(
     form: dev.opencode.client.data.FormDetail,
-    onAnswer: (Map<String, String>) -> Unit,
+    onAnswer: (Map<String, dev.opencode.client.data.FormValue>) -> Unit,
     onIgnore: () -> Unit,
 ) {
-    // 选中项与自定义输入都按字段 key 存储，多字段表单不会互相串
-    var selected by remember(form.id) { mutableStateOf<Map<String, String>>(emptyMap()) }
-    var customTexts by remember(form.id) { mutableStateOf<Map<String, String>>(emptyMap()) }
+    // 每个字段的选择/输入状态按 key 存，多字段表单不会互相串
+    var picked by remember(form.id) {
+        mutableStateOf(
+            form.fields.associate { it.key to it.default }.filterValues { it.isNotEmpty() }
+        )
+    }
+    var texts by remember(form.id) { mutableStateOf<Map<String, String>>(emptyMap()) }
+    var flags by remember(form.id) {
+        mutableStateOf(form.fields.associate { it.key to it.default.contains("true") })
+    }
+
+    fun toggle(field: dev.opencode.client.data.FormFieldInfo, value: String) {
+        val cur = picked[field.key].orEmpty()
+        picked = picked + (field.key to if (field.multiple) {
+            if (value in cur) cur - value else cur + value
+        } else {
+            listOf(value)
+        })
+    }
+
+    // 一个字段的提交值；null 表示未回答（提交时省略该字段）
+    fun answerOf(field: dev.opencode.client.data.FormFieldInfo): dev.opencode.client.data.FormValue? {
+        val text = texts[field.key].orEmpty().trim()
+        return when (field.type) {
+            "multiselect" -> {
+                val list = picked[field.key].orEmpty() +
+                    listOfNotNull(text.takeIf { it.isNotEmpty() })
+                if (list.isEmpty()) null else dev.opencode.client.data.FormValue.Multi(list.distinct())
+            }
+            "boolean" -> {
+                val on = flags[field.key] == true
+                if (on || field.required) dev.opencode.client.data.FormValue.Flag(on) else null
+            }
+            "number", "integer" ->
+                text.toDoubleOrNull()?.let { dev.opencode.client.data.FormValue.Num(it) }
+            "external" -> null
+            else -> {
+                val value = text.ifEmpty { picked[field.key].orEmpty().firstOrNull().orEmpty() }
+                if (value.isEmpty()) null else dev.opencode.client.data.FormValue.Text(value)
+            }
+        }
+    }
+
+    val visibleFields = form.fields.filterNot { it.hidden }
+    val answers = visibleFields.associate { it.key to answerOf(it) }
+    val answeredCount = answers.count { it.value != null }
+    // 必填项必须有值；多选题还要满足 minItems / maxItems
+    val canSubmit = answeredCount > 0 && visibleFields.all { f ->
+        val v = answers[f.key]
+        when {
+            v == null -> !f.required
+            f.multiple -> {
+                val n = (v as? dev.opencode.client.data.FormValue.Multi)?.values?.size ?: 0
+                n >= f.minItems && (f.maxItems <= 0 || n <= f.maxItems)
+            }
+            else -> true
+        }
+    }
 
     Surface(
         shape = MaterialTheme.shapes.medium,
         color = MaterialTheme.colorScheme.surfaceVariant,
-        border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.4f)),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.45f)),
         modifier = Modifier
             .fillMaxWidth()
-            .padding(horizontal = 10.dp, vertical = 2.dp)
+            .padding(horizontal = 10.dp, vertical = 4.dp)
     ) {
-        Column(modifier = Modifier.padding(12.dp)) {
+        Column(modifier = Modifier.padding(start = 12.dp, end = 12.dp, top = 10.dp, bottom = 6.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
                     text = "❓ " + form.title,
@@ -919,105 +982,182 @@ private fun QuestionFormCard(
                     color = MaterialTheme.colorScheme.primary,
                     modifier = Modifier.weight(1f)
                 )
+                if (visibleFields.size > 1) {
+                    Text(
+                        text = "$answeredCount/${visibleFields.size}",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
             }
-            Spacer(Modifier.height(8.dp))
-            form.fields.forEach { field ->
-                Text(
-                    text = field.title ?: field.key,
-                    style = MaterialTheme.typography.labelMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.padding(bottom = 6.dp)
-                )
-                field.options.forEach { opt ->
-                    val isSelected = selected[field.key] == opt.label
-                    Surface(
-                        onClick = {
-                            selected = selected + (field.key to opt.label)
-                            // 选择预设选项后清空该字段的自定义输入（二者互斥）
-                            customTexts = customTexts - field.key
-                        },
-                        shape = MaterialTheme.shapes.small,
-                        color = if (isSelected) MaterialTheme.colorScheme.primaryContainer
-                                else MaterialTheme.colorScheme.surface,
-                        border = BorderStroke(
-                            1.dp,
-                            if (isSelected) MaterialTheme.colorScheme.primary
-                            else MaterialTheme.colorScheme.outlineVariant
-                        ),
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(vertical = 3.dp)
-                    ) {
-                        Column(modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp)) {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                androidx.compose.material3.RadioButton(
-                                    selected = isSelected,
-                                    onClick = {
-                                        selected = selected + (field.key to opt.label)
-                                        customTexts = customTexts - field.key
-                                    },
-                                    modifier = Modifier.size(20.dp)
-                                )
-                                Spacer(Modifier.width(8.dp))
+            Spacer(Modifier.height(6.dp))
+            // 选项多时可滚动，避免把输入框挤出屏幕
+            Column(
+                modifier = Modifier
+                    .heightIn(max = 300.dp)
+                    .verticalScroll(rememberScrollState())
+            ) {
+                visibleFields.forEachIndexed { index, field ->
+                    if (visibleFields.size > 1) {
+                        Text(
+                            text = "问题 ${index + 1}/${visibleFields.size}",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(top = if (index == 0) 0.dp else 10.dp)
+                        )
+                    }
+                    Text(
+                        text = field.title ?: field.key,
+                        style = MaterialTheme.typography.titleSmall,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                    field.description?.takeIf { it.isNotBlank() && it != field.title }?.let { desc ->
+                        Text(
+                            text = desc,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(top = 2.dp)
+                        )
+                    }
+                    if (field.options.isNotEmpty()) {
+                        Text(
+                            text = if (field.multiple) "可多选" else "单选",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.primary.copy(alpha = 0.85f),
+                            modifier = Modifier.padding(top = 2.dp)
+                        )
+                    }
+                    Spacer(Modifier.height(4.dp))
+
+                    if (field.type == "boolean") {
+                        Surface(
+                            onClick = { flags = flags + (field.key to (flags[field.key] != true)) },
+                            shape = MaterialTheme.shapes.small,
+                            color = MaterialTheme.colorScheme.surface,
+                            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 3.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
                                 Text(
-                                    text = opt.label,
+                                    text = if (flags[field.key] == true) "是" else "否",
                                     style = MaterialTheme.typography.bodyMedium,
-                                    color = MaterialTheme.colorScheme.onSurface
+                                    modifier = Modifier.weight(1f)
+                                )
+                                Switch(
+                                    checked = flags[field.key] == true,
+                                    onCheckedChange = { flags = flags + (field.key to it) }
                                 )
                             }
-                            opt.description?.let { desc ->
-                                Text(
-                                    text = desc,
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    modifier = Modifier.padding(start = 28.dp, top = 2.dp)
+                        }
+                    } else {
+                        field.options.forEach { opt ->
+                            val selected = picked[field.key].orEmpty().contains(opt.value)
+                            Surface(
+                                onClick = { toggle(field, opt.value) },
+                                shape = MaterialTheme.shapes.small,
+                                color = if (selected) MaterialTheme.colorScheme.primaryContainer
+                                        else MaterialTheme.colorScheme.surface,
+                                border = BorderStroke(
+                                    1.dp,
+                                    if (selected) MaterialTheme.colorScheme.primary
+                                    else MaterialTheme.colorScheme.outlineVariant
+                                ),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(vertical = 3.dp)
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 8.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    if (field.multiple) {
+                                        Checkbox(
+                                            checked = selected,
+                                            onCheckedChange = { toggle(field, opt.value) },
+                                            modifier = Modifier.size(22.dp)
+                                        )
+                                    } else {
+                                        RadioButton(
+                                            selected = selected,
+                                            onClick = { toggle(field, opt.value) },
+                                            modifier = Modifier.size(22.dp)
+                                        )
+                                    }
+                                    Spacer(Modifier.width(8.dp))
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            text = opt.label,
+                                            style = MaterialTheme.typography.bodyMedium,
+                                            color = MaterialTheme.colorScheme.onSurface
+                                        )
+                                        opt.description?.takeIf { it.isNotBlank() }?.let { desc ->
+                                            Text(
+                                                text = desc,
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                modifier = Modifier.padding(top = 1.dp)
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // 自由输入：custom=true、无选项、或文本/数字类型
+                        val wantsCustom = field.custom || field.options.isEmpty()
+                        if (wantsCustom) {
+                            val text = texts[field.key].orEmpty()
+                            Surface(
+                                shape = MaterialTheme.shapes.small,
+                                color = if (text.isNotBlank()) MaterialTheme.colorScheme.primaryContainer
+                                        else MaterialTheme.colorScheme.surface,
+                                border = BorderStroke(
+                                    1.dp,
+                                    if (text.isNotBlank()) MaterialTheme.colorScheme.primary
+                                    else MaterialTheme.colorScheme.outlineVariant
+                                ),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(vertical = 3.dp)
+                            ) {
+                                BasicTextField(
+                                    value = text,
+                                    onValueChange = { texts = texts + (field.key to it) },
+                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 10.dp),
+                                    textStyle = MaterialTheme.typography.bodyMedium.copy(
+                                        color = MaterialTheme.colorScheme.onSurface
+                                    ),
+                                    cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
+                                    maxLines = 4,
+                                    keyboardOptions = if (field.type == "number" || field.type == "integer") {
+                                        KeyboardOptions(keyboardType = KeyboardType.Number)
+                                    } else {
+                                        KeyboardOptions.Default
+                                    },
+                                    decorationBox = { inner ->
+                                        Box {
+                                            if (text.isEmpty()) {
+                                                Text(
+                                                    text = field.placeholder ?: "或者输入自定义回答…",
+                                                    style = MaterialTheme.typography.bodyMedium,
+                                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                                )
+                                            }
+                                            inner()
+                                        }
+                                    }
                                 )
                             }
                         }
                     }
                 }
-                // custom=true 或无选项：提供自由输入（按字段 key 独立存储）
-                if (field.custom || field.options.isEmpty()) {
-                    val customText = customTexts[field.key].orEmpty()
-                    Surface(
-                        shape = MaterialTheme.shapes.small,
-                        color = if (customText.isNotBlank()) MaterialTheme.colorScheme.primaryContainer
-                                else MaterialTheme.colorScheme.surface,
-                        border = BorderStroke(
-                            1.dp,
-                            if (customText.isNotBlank()) MaterialTheme.colorScheme.primary
-                            else MaterialTheme.colorScheme.outlineVariant
-                        ),
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(vertical = 3.dp)
-                    ) {
-                        BasicTextField(
-                            value = customText,
-                            onValueChange = { customTexts = customTexts + (field.key to it) },
-                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 10.dp),
-                            textStyle = MaterialTheme.typography.bodyMedium.copy(
-                                color = MaterialTheme.colorScheme.onSurface
-                            ),
-                            cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
-                            maxLines = 3,
-                            decorationBox = { inner ->
-                                Box {
-                                    if (customText.isEmpty()) {
-                                        Text(
-                                            text = "或者输入自定义回答…",
-                                            style = MaterialTheme.typography.bodyMedium,
-                                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                                        )
-                                    }
-                                    inner()
-                                }
-                            }
-                        )
-                    }
-                }
             }
-            Spacer(Modifier.height(8.dp))
+            Spacer(Modifier.height(6.dp))
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End),
@@ -1031,23 +1171,14 @@ private fun QuestionFormCard(
                         .clickable { onIgnore() }
                         .padding(horizontal = 10.dp, vertical = 8.dp)
                 )
-                // 可提交：每个字段都有值（选中项或自定义文本）
-                val allAnswered = form.fields.all { f ->
-                    selected[f.key]?.isNotBlank() == true ||
-                        ((f.custom || f.options.isEmpty()) && customTexts[f.key]?.isNotBlank() == true)
-                }
                 Button(
                     onClick = {
-                        val values = selected.toMutableMap()
-                        form.fields.forEach { f ->
-                            val custom = customTexts[f.key]
-                            if ((f.custom || f.options.isEmpty()) && custom?.isNotBlank() == true) {
-                                values[f.key] = custom.trim()
-                            }
-                        }
+                        val values = visibleFields
+                            .mapNotNull { f -> answerOf(f)?.let { f.key to it } }
+                            .toMap()
                         onAnswer(values)
                     },
-                    enabled = allAnswered,
+                    enabled = canSubmit,
                     contentPadding = PaddingValues(horizontal = 18.dp, vertical = 8.dp)
                 ) {
                     Text("提交", style = MaterialTheme.typography.labelMedium)

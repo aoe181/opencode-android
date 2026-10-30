@@ -13,6 +13,7 @@ import dev.opencode.client.data.CommandInfo
 import dev.opencode.client.data.EventStream
 import dev.opencode.client.data.FileAttachment
 import dev.opencode.client.data.FormDetail
+import dev.opencode.client.data.FormValue
 import dev.opencode.client.data.McpServerInfo
 import dev.opencode.client.data.ModelInfo
 import dev.opencode.client.data.ModelSelection
@@ -31,6 +32,7 @@ import dev.opencode.client.data.toolDisplayFromMetadata
 import dev.opencode.client.data.joinContentText
 import dev.opencode.client.data.num
 import dev.opencode.client.data.parseFileChanges
+import dev.opencode.client.data.parseFormObject
 import dev.opencode.client.data.str
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -97,7 +99,11 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     private var server: RemoteServer? = null
     private var sessionID: String? = null
     private var streamJob: Job? = null
+    /** 已回答/已忽略的表单 id：轮询可能晚于回复事件，避免刚提交的卡片又弹回来 */
+    private val settledForms = HashSet<String>()
+
     private var formSyncJob: Job? = null
+    private var formWatchJob: Job? = null
     private var reconcileJob: Job? = null
 
     private var history: List<ChatMessage> = emptyList()
@@ -145,6 +151,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         reasoningStart.clear()
         pendingUser.clear()
         pendingDelivery.clear()
+        settledForms.clear()
         lastShellCall.clear()
         lastShellCallMid.clear()
         history = emptyList()
@@ -156,8 +163,29 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         syncStreamingState()
         syncInbox()
         syncForms()
+        startFormWatch()
         startStream()
         startPeriodicReconcile()
+    }
+
+    /**
+     * 表单兜底轮询：SSE 的 form.created 是主通道，这里只在整个会话执行期间、
+     * 且当前没有待回答表单时每 2 秒查一次，避免漏帧导致表单迟迟不弹。
+     */
+    private fun startFormWatch() {
+        formWatchJob?.cancel()
+        formWatchJob = viewModelScope.launch {
+            while (isActive) {
+                delay(2000)
+                val s = server ?: continue
+                val sid = sessionID ?: continue
+                if (!_ui.value.streaming) continue
+                if (_ui.value.pendingForm != null) continue
+                val list = api.pendingForms(s, sid).getOrNull() ?: continue
+                val form = list.firstOrNull { it.kind == null || it.kind == "question" } ?: continue
+                setPendingForm(form)
+            }
+        }
     }
 
     /**
@@ -200,6 +228,8 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         streamJob = null
         formSyncJob?.cancel()
         formSyncJob = null
+        formWatchJob?.cancel()
+        formWatchJob = null
         reconcileJob?.cancel()
         reconcileJob = null
         sessionID = null
@@ -637,42 +667,52 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /** 设置待回答表单（忽略已结算的表单，防止轮询把刚提交的卡片重新弹回来）。 */
+    private fun setPendingForm(form: FormDetail?) {
+        if (form != null && form.id in settledForms) return
+        _ui.update { it.copy(pendingForm = form) }
+    }
+
     /** 同步待回答表单（question 工具）。 answered/cancelled 的表单不会出现在列表里，自动清除。 */
     fun syncForms() {
         val s = server ?: return
         val sid = sessionID ?: return
         viewModelScope.launch {
             api.pendingForms(s, sid).onSuccess { list ->
-                _ui.update { it.copy(pendingForm = list.firstOrNull()) }
+                val form = list.firstOrNull { it.kind == null || it.kind == "question" }
+                setPendingForm(form)
             }
         }
     }
 
     /**
      * question 工具执行后才创建表单，事件到达时表单可能还没就绪，
-     * 轮询几次直到拿到 pending 表单。
+     * 短轮询几次兜底（正常情况 form.created 事件会先到）。
      */
     fun scheduleFormSync() {
         formSyncJob?.cancel()
         formSyncJob = viewModelScope.launch {
             val s = server ?: return@launch
             val sid = sessionID ?: return@launch
-            repeat(5) {
-                delay(600)
+            repeat(8) {
+                delay(500)
+                if (_ui.value.pendingForm != null) return@launch
                 val list = api.pendingForms(s, sid).getOrNull()
-                if (!list.isNullOrEmpty()) {
-                    _ui.update { it.copy(pendingForm = list.firstOrNull()) }
+                val form = list?.firstOrNull { it.kind == null || it.kind == "question" }
+                if (form != null) {
+                    setPendingForm(form)
                     return@launch
                 }
             }
         }
     }
 
-    /** 提交回答：key -> 值（选项 label 或自由文本）。 */
-    fun answerForm(form: FormDetail, values: Map<String, String>) {
+    /** 提交回答：key -> 值（选项 value、多选数组、自由文本或布尔/数字）。 */
+    fun answerForm(form: FormDetail, values: Map<String, FormValue>) {
         val s = server ?: return
         val sid = sessionID ?: return
         // 乐观收起卡片；失败时下次 syncForms 会重新拉回来
+        settledForms.add(form.id)
         _ui.update { it.copy(pendingForm = null) }
         viewModelScope.launch {
             api.replyForm(s, sid, form.id, values)
@@ -681,6 +721,8 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                     refreshRecent()
                 }
                 .onFailure { e ->
+                    // 提交失败：撤销结算标记，让表单重新出现（否则轮询会一直忽略它）
+                    settledForms.remove(form.id)
                     _ui.update { it.copy(error = "提交失败：${e.message}") }
                     syncForms()
                 }
@@ -691,11 +733,13 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     fun ignoreForm(formID: String) {
         val s = server ?: return
         val sid = sessionID ?: return
+        settledForms.add(formID)
         _ui.update { it.copy(pendingForm = null) }
         viewModelScope.launch {
             api.cancelForm(s, sid, formID)
                 .onSuccess { refreshRecent() }
                 .onFailure { e ->
+                    settledForms.remove(formID)
                     _ui.update { it.copy(error = "忽略失败：${e.message}") }
                     syncForms()
                 }
@@ -838,6 +882,31 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     private fun handleEvent(event: OpenCodeEvent) {
         val sid = sessionID ?: return
         val data = event.data
+
+        // 表单事件必须在下面的 sessionID 过滤之前处理：
+        // form.created 的 sessionID 嵌在 data.form 里，顶层没有。
+        // 这是表单"立刻弹出"的权威来源（Web 端同样订阅这条事件），不必等轮询。
+        when (event.type) {
+            "form.created" -> {
+                val formObj = data["form"] as? JsonObject ?: return
+                val form = parseFormObject(formObj) ?: return
+                if (form.sessionID != sid) return
+                // 只接管 question（其他 kind 由 Web 的对应 dock 处理，本 App 不支持）
+                if (form.kind != null && form.kind != "question") return
+                setPendingForm(form)
+                return
+            }
+            "form.replied", "form.cancelled" -> {
+                if (data.str("sessionID") != sid) return
+                val id = data.str("id") ?: return
+                settledForms.add(id)
+                _ui.update { st ->
+                    if (st.pendingForm?.id == id) st.copy(pendingForm = null) else st
+                }
+                return
+            }
+        }
+
         if (data.str("sessionID") != sid) return
 
         when (event.type) {
@@ -907,6 +976,8 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 val mid = data.str("assistantMessageID") ?: return
                 val callId = data.str("id") ?: return
                 val text = data.str("text") ?: return
+                // question 工具的输入里带 questions 数组：提前拉一次表单
+                if (text.contains("questions")) scheduleFormSync()
                 // 输入完整到手：用完整文本重新识别（input.delta 阶段可能只拿到部分）
                 val mcpTool = extractMcpToolNameFromRaw(text)
                 upsertTool(mid, callId) {
