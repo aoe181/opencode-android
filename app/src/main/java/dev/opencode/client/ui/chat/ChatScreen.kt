@@ -143,8 +143,10 @@ fun ChatScreen(mainVm: MainViewModel) {
             val info = listState.layoutInfo.visibleItemsInfo.firstOrNull()
             info?.key to (info?.offset ?: 0)
         }.collect { (id, offset) ->
-            if (restoredOnce && id != null) {
-                anchorId = id
+            // LazyListItemInfo.key 是 Any?，必须安全转型为消息 id（String?）
+            val messageId = id as? String
+            if (restoredOnce && messageId != null) {
+                anchorId = messageId
                 anchorOffset = offset
             }
         }
