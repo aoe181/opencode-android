@@ -131,6 +131,8 @@ fun ChatScreen(mainVm: MainViewModel) {
             last >= info.totalItemsCount - 2
         }.collect { atBottom -> autoScroll.value = atBottom }
     }
+    // 首次进入会话：优先恢复上次位置；没有记录则回到底部
+    var restoredOnce by remember(sessionId) { mutableStateOf(false) }
     // 视口锚点：记录首条可见消息的 id 与偏移。
     // 历史分页会在顶部插入更旧的消息，所有索引随之漂移；若按索引定位，
     // 视口内容会瞬间变成"上面"的消息——这就是进入会话/发送时屏幕向上跳的原因。
@@ -147,8 +149,6 @@ fun ChatScreen(mainVm: MainViewModel) {
             }
         }
     }
-    // 首次进入会话：优先恢复上次位置；没有记录则回到底部
-    var restoredOnce by remember(sessionId) { mutableStateOf(false) }
     LaunchedEffect(state.messages.size) {
         if (state.messages.isEmpty()) return@LaunchedEffect
         if (!restoredOnce) {
