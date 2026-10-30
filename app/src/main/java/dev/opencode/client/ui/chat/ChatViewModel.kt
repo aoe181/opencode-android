@@ -26,6 +26,7 @@ import dev.opencode.client.data.extractMcpToolNameFromRaw
 import dev.opencode.client.data.extractMcpToolNameFromText
 import dev.opencode.client.data.inferToolNameFromInput
 import dev.opencode.client.data.parseToolInput
+import dev.opencode.client.data.toolDisplayFromMetadata
 import dev.opencode.client.data.joinContentText
 import dev.opencode.client.data.num
 import dev.opencode.client.data.parseFileChanges
@@ -765,19 +766,9 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 val callId = data.str("id") ?: return
                 // 兜底起点：真正的锚点在 tool.called（对应服务器 part.time.ran）
                 toolStart.putIfAbsent(callId, event.created ?: System.currentTimeMillis())
-                upsertBlock(mid, "c:$callId") { existing ->
-                    val cur = (existing as? Block.Tool)?.call
-                    when {
-                        cur == null ->
-                            Block.Tool(ToolCall(callId, data.str("name") ?: "tool", "running"))
-                        // 已识别出 MCP 工具名的不回退：started 事件偶尔晚到，
-                        // 会把已经显示的 mcp + 工具名覆盖回 execute（刷新前一直错）
-                        cur.name == "mcp" || cur.title != null -> Block.Tool(cur)
-                        else -> Block.Tool(
-                            cur.copy(name = data.str("name") ?: cur.name, state = "running")
-                        )
-                    }
-                }
+                // 注意：这里不创建卡片。此阶段只知道名字是 execute，
+                // 创建后要等 input.ended 才能改对，用户会看到一个 300ms 的 execute 闪现。
+                // 卡片统一在 input.ended / tool.called / tool.progress（带权威工具名）时出现。
                 publish()
             }
             "session.tool.input.delta" -> {
@@ -857,6 +848,8 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 val background = metadata?.str("shellID") != null &&
                     (metadata["exit"] as? JsonPrimitive) == null &&
                     outputText?.startsWith("Command moved to the background") == true
+                // 权威工具名（若事件带了 toolCalls）
+                val display = toolDisplayFromMetadata(metadata)
                 upsertTool(mid, callId) {
                     it.copy(
                         // 后台运行中不标记完成；普通命令仍按 success
@@ -868,7 +861,8 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                         fileChanges = parseFileChanges(metadata),
                         background = background,
                         shellID = metadata?.str("shellID") ?: it.shellID,
-                        title = if (background) "已转入后台" else it.title,
+                        title = if (background) "已转入后台" else (display?.second ?: it.title),
+                        name = display?.first ?: it.name,
                     )
                 }
                 publish()
@@ -876,11 +870,14 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             "session.tool.failed" -> {
                 val mid = data.str("assistantMessageID") ?: return
                 val callId = data.str("id") ?: return
+                val display = toolDisplayFromMetadata(data["metadata"] as? JsonObject)
                 upsertTool(mid, callId) {
                     it.copy(
                         state = "failed",
                         output = joinContentText(data["content"] as? JsonArray) ?: it.output,
                         durationMs = durationFor(callId, event.created) ?: it.durationMs,
+                        name = display?.first ?: it.name,
+                        title = display?.second ?: it.title,
                     )
                 }
                 publish()
@@ -977,6 +974,17 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 }
                 val mid = data.str("assistantMessageID") ?: return
                 synchronized(lastShellCall) { lastShellCallMid[callId] = mid }
+                // 权威工具名：metadata.toolCalls[].tool 形如 "local-mcp.mt_apk_search"，
+                // 是服务器给的，比从 input.code 跑正则可靠。卡片此时若已存在则原地修正，
+                // 不存在则在此创建（进度事件意味着输入已完整，不会再闪 execute）
+                val display = toolDisplayFromMetadata(metadata)
+                if (display != null) {
+                    upsertTool(mid, callId) { cur ->
+                        // 已识别的不回退；并发多工具时保留 "第一个 +N" 标题
+                        cur.copy(name = display.first, title = display.second)
+                    }
+                    publish()
+                }
             }
             "session.inbox.enqueued" -> {
                 // 事件结构可能是 {inboxID, item} 也可能直接就是 Inbox.Item 本身，

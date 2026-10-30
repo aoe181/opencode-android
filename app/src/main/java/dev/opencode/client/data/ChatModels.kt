@@ -256,13 +256,16 @@ private fun parseToolPart(obj: JsonObject, index: Int, shellResults: Map<String,
     val finalTruncated = shellResult?.truncated ?: ((metadata?.get("truncated") as? JsonPrimitive)?.content == "true")
 
     val rawName = obj.str("name") ?: "tool"
-    // MCP 工具都通过 execute(code mode) 调用，标题统一是 execute；
-    // 从 input.code 里解析真实工具名，让卡片显示具体调用的 MCP 工具
-    val mcpTool = if (rawName == "execute") extractMcpToolName(inputObj) else null
+    // 工具名优先级：
+    // 1) metadata.toolCalls —— 服务器权威数据（"local-mcp.mt_apk_search"），
+    //    一次 execute 并发调多个工具时标题为 "第一个 +N"
+    // 2) input.code 正则提取（老数据没有 toolCalls 时兜底）
+    val metaDisplay = toolDisplayFromMetadata(metadata)
+    val mcpTool = if (metaDisplay == null && rawName == "execute") extractMcpToolName(inputObj) else null
 
     val call = ToolCall(
         id = obj.str("id") ?: "tool-$index",
-        name = if (mcpTool != null) "mcp" else rawName,
+        name = metaDisplay?.first ?: if (mcpTool != null) "mcp" else rawName,
         state = when {
             background -> "running"
             shellResult != null -> if (finalExit == null || finalExit == 0) "success" else "failed"
@@ -270,7 +273,10 @@ private fun parseToolPart(obj: JsonObject, index: Int, shellResults: Map<String,
             status == "error" || status == "failed" -> "failed"
             else -> "running"
         },
-        title = mcpTool ?: deriveToolTitle(inputObj) ?: if (background) "已转入后台" else null,
+        title = metaDisplay?.second
+            ?: mcpTool
+            ?: deriveToolTitle(inputObj)
+            ?: if (background) "已转入后台" else null,
         input = inputObj?.toString(),
         output = finalOutput,
         exit = finalExit,
@@ -352,6 +358,29 @@ private fun isCompleteIdent(text: String, indexAfterName: Int): Boolean {
 internal fun extractMcpToolNameFromRaw(raw: String?): String? {
     val obj = parseToolInput(raw) ?: return null
     return extractMcpToolName(obj)
+}
+
+/**
+ * 从 metadata.toolCalls 提取权威显示（badge to title）。
+ *
+ * 进度事件（session.tool.progress）与历史消息的 state.metadata 都带这个字段，
+ * 格式形如 "local-mcp.mt_apk_search"，是服务器给出的权威工具名，
+ * 比从 input.code 里跑正则可靠得多。无命名空间（不含点）时返回 null 交给推断。
+ */
+internal fun toolDisplayFromMetadata(metadata: JsonObject?): Pair<String, String>? {
+    val calls = metadata?.get("toolCalls") as? JsonArray ?: return null
+    val names = calls.mapNotNull { (it as? JsonObject)?.str("tool") }
+    if (names.isEmpty()) return null
+    val primary = names.first()
+    if ('.' !in primary) return null
+    val namespace = primary.substringBefore('.')
+    val tool = primary.substringAfter('.')
+    if (tool.isEmpty()) return null
+    // 一次 execute 里并发调了多个工具时，标题显示 "第一个 +N"
+    val title = if (names.size > 1) "$tool +${names.size - 1}" else tool
+    // 内置 code mode 工具（opencode.*）保持 execute 徽标，MCP 服务器显示 mcp
+    val badge = if (namespace == "opencode") "execute" else "mcp"
+    return badge to title
 }
 
 /** 宽松解析工具输入 JSON（流式分片可能不完整，失败返回 null）。 */
