@@ -104,8 +104,40 @@ class OpenCodeApi {
             ServerInfo(element as? JsonObject ?: JsonObject(emptyMap()))
         }
 
-    suspend fun sessions(server: RemoteServer): Result<List<SessionSummary>> =
-        get(server, "/api/session").mapCatching(::parseSessions)
+    /**
+     * 会话列表（分页）。返回 (会话, 是否有更多)，cursor 由调用方保存下一页。
+     * 服务器默认只返回最新 50 个会话，长列表必须翻页才能看到旧会话。
+     */
+    suspend fun sessions(
+        server: RemoteServer,
+        limit: Int = 50,
+        cursor: String? = null,
+    ): Result<Pair<List<SessionSummary>, String?>> =
+        get(
+            server,
+            buildString {
+                append("/api/session?limit=").append(limit)
+                if (cursor != null) append("&cursor=").append(cursor)
+            }
+        ).mapCatching { body ->
+            val root = json.parseToJsonElement(body)
+            val arr = when {
+                root is JsonArray -> root
+                root is JsonObject && root["data"] is JsonArray -> root["data"] as JsonArray
+                else -> JsonArray(emptyList())
+            }
+            val list = arr.mapNotNull { element ->
+                val obj = element as? JsonObject ?: return@mapNotNull null
+                val id = (obj["id"] as? JsonPrimitive)?.content ?: return@mapNotNull null
+                val title = (obj["title"] as? JsonPrimitive)?.content
+                SessionSummary(id, title?.takeIf { it.isNotBlank() } ?: "(未命名会话)")
+            }
+            val next = (root as? JsonObject)?.let { r ->
+                (r["cursor"] as? JsonObject)?.get("next")
+                    ?.let { (it as? JsonPrimitive)?.takeIf { p -> p.isString }?.content }
+            }
+            list to next
+        }
 
     suspend fun createSession(server: RemoteServer): Result<String> =
         post(server, "/api/session", "{}").mapCatching { body ->
@@ -113,7 +145,18 @@ class OpenCodeApi {
         }
 
     /** 历史消息：服务器 limit 上限 200，需按 cursor 翻页取全量（API 次数等统计依赖完整历史）。 */
-    suspend fun messages(server: RemoteServer, sessionID: String): Result<List<ChatMessage>> =
+    /**
+     * 历史消息，分两阶段返回（首屏优先）：
+     * 1. [onFirstPage]：第一页（200 条）立刻回调，UI 可以立即渲染；
+     * 2. 返回值：全部翻页后的完整列表（用于统计 api 次数等）。
+     *
+     * 长会话（上千条）串行翻页会阻塞 1~2 秒，首屏优先能让用户几乎无感。
+     */
+    suspend fun messages(
+        server: RemoteServer,
+        sessionID: String,
+        onFirstPage: (suspend (List<ChatMessage>) -> Unit)? = null,
+    ): Result<List<ChatMessage>> =
         withContext(Dispatchers.IO) {
             runCatching {
                 val all = ArrayList<ChatMessage>(512)
@@ -126,7 +169,12 @@ class OpenCodeApi {
                         if (cursor == null) append("&order=desc") else append("&cursor=").append(cursor)
                     }
                     val body = get(server, path).getOrThrow()
-                    all += parseMessages(body)
+                    val page = parseMessages(body)
+                    all += page
+                    if (pages == 0 && onFirstPage != null) {
+                        // 第一页已到手：先让 UI 显示（此时是倒序的第一页，需反转）
+                        onFirstPage(page.reversed())
+                    }
                     val root = json.parseToJsonElement(body) as? JsonObject
                     cursor = (root?.get("cursor") as? JsonObject)
                         ?.get("next")?.let { (it as? JsonPrimitive)?.takeIf { p -> p.isString }?.content }
@@ -199,6 +247,14 @@ class OpenCodeApi {
     suspend fun commands(server: RemoteServer): Result<List<CommandInfo>> =
         get(server, "/api/command").mapCatching(::parseCommands)
 
+    /** MCP 服务器列表（/api/mcp）。 */
+    suspend fun mcpServers(server: RemoteServer): Result<List<McpServerInfo>> =
+        get(server, "/api/mcp").mapCatching(::parseMcpServers)
+
+    /** 技能列表（/api/skill）。 */
+    suspend fun skills(server: RemoteServer): Result<List<SkillInfo>> =
+        get(server, "/api/skill").mapCatching(::parseSkills)
+
     private fun attachmentsJson(files: List<FileAttachment>): JsonArray =        JsonArray(files.map { f ->
             // 客户端只发 uri（同 Web 的 admission.files）：服务器 materializeAttachment
             // 会按 data: / file: 前缀自行解码，额外字段会被 additionalProperties:false 拒绝
@@ -247,6 +303,11 @@ class OpenCodeApi {
         return JsonObject(body).toString()
     }
 
+    /** 只取最新一页消息（200 条）：发送后/一轮结束时增量刷新用，避免长会话全量翻页。 */
+    suspend fun recentMessages(server: RemoteServer, sessionID: String): Result<List<ChatMessage>> =
+        get(server, "/api/session/$sessionID/message?order=desc&limit=200")
+            .mapCatching { body -> parseMessages(body).reversed() }
+
     /** 上传文件到服务器临时目录（Web 同款：POST /api/experimental/fs/write）。返回服务器绝对路径。 */
     suspend fun uploadAttachment(
         server: RemoteServer,
@@ -283,6 +344,23 @@ class OpenCodeApi {
                 if (!resp.isSuccessful) error("上传失败 HTTP ${resp.code}: ${body.take(200)}")
                 val json = json.parseToJsonElement(body) as? JsonObject
                 ((json?.get("data") as? JsonObject)?.str("path")) ?: target
+            }
+        }
+    }
+
+    /** 重命名会话。 */
+    suspend fun renameSession(server: RemoteServer, sessionID: String, title: String): Result<Unit> {
+        val body = kotlinx.serialization.json.JsonObject(
+            mapOf("title" to kotlinx.serialization.json.JsonPrimitive(title))
+        )
+        return withContext(Dispatchers.IO) {
+            runCatching {
+                val req = request(server, "/api/session/$sessionID")
+                    .patch(body.toString().toRequestBody("application/json; charset=utf-8".toMediaType()))
+                    .build()
+                client.newCall(req).execute().use { resp ->
+                    if (!resp.isSuccessful) error("HTTP ${resp.code}")
+                }
             }
         }
     }

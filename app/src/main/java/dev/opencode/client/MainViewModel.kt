@@ -25,9 +25,16 @@ data class MainUiState(
     val server: RemoteServer? = null,
     val serverInfo: ServerInfo? = null,
     val sessions: List<SessionSummary> = emptyList(),
+    /** 会话列表下一页 cursor（null = 没有更多）。 */
+    val sessionsCursor: String? = null,
+    val loadingMore: Boolean = false,
 )
 
 class MainViewModel(app: Application) : AndroidViewModel(app) {
+
+    private companion object {
+        const val PAGE_SIZE = 50
+    }
 
     private val settings = SettingsStore(app)
     private val api = OpenCodeApi()
@@ -47,6 +54,15 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         _drafts.update { it + (sessionID to text) }
     }
 
+    /** 各会话上次浏览到的消息索引（切对话回来恢复位置）。 */
+    private val _scrollPositions = mutableMapOf<String, Int>()
+
+    fun saveScrollPosition(sessionID: String, index: Int) {
+        _scrollPositions[sessionID] = index
+    }
+
+    fun scrollPosition(sessionID: String): Int? = _scrollPositions[sessionID]
+
     fun openSession(id: String, title: String) {
         _selected.value = id to title
     }
@@ -58,7 +74,11 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     init {
         viewModelScope.launch {
-            settings.load()?.let { saved ->
+            // 启动加速：先并行取「已保存的服务器」与「主题设置」，
+            // 拿到地址后 info + sessions 也已并行（见 verify），整体冷启动更快
+            val saved = settings.load()
+            if (saved != null) {
+                // 立即进入"正在连接"过渡态，UI 不等网络
                 _uiState.update { it.copy(server = saved, loading = true, restoring = true) }
                 verify(saved)
             }
@@ -75,6 +95,51 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         val server = _uiState.value.server ?: return
         _uiState.update { it.copy(loading = true, message = null) }
         viewModelScope.launch { verify(server) }
+    }
+
+    /** 加载更多会话（列表翻页）。 */
+    fun loadMoreSessions() {
+        val server = _uiState.value.server ?: return
+        val cursor = _uiState.value.sessionsCursor ?: return
+        if (_uiState.value.loadingMore) return
+        _uiState.update { it.copy(loadingMore = true) }
+        viewModelScope.launch {
+            api.sessions(server, PAGE_SIZE, cursor)
+                .onSuccess { (more, next) ->
+                    _uiState.update { st ->
+                        st.copy(
+                            sessions = (st.sessions + more).distinctBy { it.id },
+                            sessionsCursor = next,
+                            loadingMore = false,
+                        )
+                    }
+                }
+                .onFailure { e ->
+                    _uiState.update {
+                        it.copy(loadingMore = false, message = "加载更多失败：${e.message}")
+                    }
+                }
+        }
+    }
+
+    /** 重命名会话。 */
+    fun renameSession(id: String, title: String) {
+        val server = _uiState.value.server ?: return
+        val trimmed = title.trim()
+        if (trimmed.isEmpty()) return
+        viewModelScope.launch {
+            api.renameSession(server, id, trimmed)
+                .onSuccess {
+                    _uiState.update { st ->
+                        st.copy(sessions = st.sessions.map {
+                            if (it.id == id) it.copy(title = trimmed) else it
+                        })
+                    }
+                }
+                .onFailure { e ->
+                    _uiState.update { it.copy(message = "重命名失败：${e.message}") }
+                }
+        }
     }
 
     fun deleteSession(id: String) {
@@ -118,11 +183,12 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     private suspend fun verify(server: RemoteServer) {
         coroutineScope {
             val infoDeferred = async { api.info(server) }
-            val sessionsDeferred = async { api.sessions(server) }
+            val sessionsDeferred = async { api.sessions(server, PAGE_SIZE) }
             infoDeferred.await()
                 .onSuccess { info ->
                     settings.save(server)
-                    val sessions = sessionsDeferred.await().getOrElse { emptyList() }
+                    val (sessions, cursor) = sessionsDeferred.await()
+                        .getOrElse { emptyList<SessionSummary>() to null }
                     _uiState.update {
                         it.copy(
                             loading = false,
@@ -132,6 +198,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                             server = server,
                             serverInfo = info,
                             sessions = sessions,
+                            sessionsCursor = cursor,
                         )
                     }
                 }

@@ -52,6 +52,7 @@ data class ChatMessage(
     val totalTokens: Long? = null, // 官方 contextUsage 分子（assistant 带 tokens 时）
     val images: List<MessageImage> = emptyList(), // user 消息附带的图片（内联 base64）
     val attachments: List<MessageAttachment> = emptyList(), // 路径引用的附件（Web 的 metadata.attachments）
+    val timestampMs: Long? = null, // 消息创建时间（长按面板显示）
 ) {
     fun textContent(): String =
         blocks.filterIsInstance<Block.Text>()
@@ -253,9 +254,14 @@ private fun parseToolPart(obj: JsonObject, index: Int, shellResults: Map<String,
     val finalOutput = shellResult?.output?.takeIf { it.isNotBlank() } ?: outputText
     val finalTruncated = shellResult?.truncated ?: ((metadata?.get("truncated") as? JsonPrimitive)?.content == "true")
 
+    val rawName = obj.str("name") ?: "tool"
+    // MCP 工具都通过 execute(code mode) 调用，标题统一是 execute；
+    // 从 input.code 里解析真实工具名，让卡片显示具体调用的 MCP 工具
+    val mcpTool = if (rawName == "execute") extractMcpToolName(inputObj) else null
+
     val call = ToolCall(
         id = obj.str("id") ?: "tool-$index",
-        name = obj.str("name") ?: "tool",
+        name = if (mcpTool != null) "mcp" else rawName,
         state = when {
             background -> "running"
             shellResult != null -> if (finalExit == null || finalExit == 0) "success" else "failed"
@@ -263,7 +269,7 @@ private fun parseToolPart(obj: JsonObject, index: Int, shellResults: Map<String,
             status == "error" || status == "failed" -> "failed"
             else -> "running"
         },
-        title = deriveToolTitle(inputObj) ?: if (background) "已转入后台" else null,
+        title = mcpTool ?: deriveToolTitle(inputObj) ?: if (background) "已转入后台" else null,
         input = inputObj?.toString(),
         output = finalOutput,
         exit = finalExit,
@@ -285,7 +291,20 @@ private fun parseToolPart(obj: JsonObject, index: Int, shellResults: Map<String,
 }
 
 /**
- * 解析 GET /api/session/{id}/message 响应。
+ * 从 execute 工具的 input.code 中提取真实 MCP 工具名。
+ * 形如：tools["local-mcp"].mt_apk_list_available_apks({...})  →  local-mcp · mt_apk_list_available_apks
+ */
+internal fun extractMcpToolName(input: JsonObject?): String? {
+    val code = input?.str("code") ?: return null
+    val m = MCP_TOOL_REGEX.find(code) ?: return null
+    return m.groupValues[1] + " · " + m.groupValues[2]
+}
+
+/** tools["server"].toolName(...) —— 从 code mode 代码里取真实 MCP 工具。 */
+private val MCP_TOOL_REGEX =
+    Regex("tools\\[\\s*[\"']([^\"']+)[\"']\\s*\\]\\s*\\.\\s*([A-Za-z0-9_]+)")
+
+/** 解析 GET /api/session/{id}/message 响应。
  * user 消息文本在顶层 text 字段（payload.text 是 prompt 响应形状，作兜底），
  * assistant 在 content[]；content[] 数组顺序即渲染顺序。
  * synthetic / idle 等类型无文本块，解析后自然被过滤。
@@ -420,6 +439,7 @@ fun parseMessages(body: String): List<ChatMessage> {
             totalTokens = totalTokens,
             images = images,
             attachments = attachments,
+            timestampMs = (obj["time"] as? JsonObject)?.num("created"),
         )
     }
 }
@@ -490,6 +510,33 @@ fun parseModels(body: String): List<ModelInfo> = parseDataArray(body) { obj ->
         inputTypes = ((obj["capabilities"] as? JsonObject)?.get("input") as? JsonArray)
             ?.mapNotNull { v -> (v as? JsonPrimitive)?.takeIf { it.isString }?.content }
             .orEmpty(),
+    )
+}
+
+/** MCP 服务器信息。 */
+data class McpServerInfo(
+    val name: String,
+    val status: String?,
+)
+
+/** 技能信息。 */
+data class SkillInfo(
+    val name: String,
+    val description: String?,
+)
+
+fun parseMcpServers(body: String): List<McpServerInfo> = parseDataArray(body) { obj ->
+    McpServerInfo(
+        name = obj.str("name") ?: return@parseDataArray null,
+        status = (obj["status"] as? JsonObject)?.str("status")
+            ?: obj.str("status"),
+    )
+}
+
+fun parseSkills(body: String): List<SkillInfo> = parseDataArray(body) { obj ->
+    SkillInfo(
+        name = obj.str("name") ?: obj.str("id") ?: return@parseDataArray null,
+        description = obj.str("description"),
     )
 }
 

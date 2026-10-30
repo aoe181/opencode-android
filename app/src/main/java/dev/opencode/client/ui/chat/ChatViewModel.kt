@@ -20,6 +20,7 @@ import dev.opencode.client.data.RemoteServer
 import dev.opencode.client.data.Tokens
 import dev.opencode.client.data.ToolCall
 import dev.opencode.client.data.deriveToolTitle
+import dev.opencode.client.data.extractMcpToolName
 import dev.opencode.client.data.joinContentText
 import dev.opencode.client.data.num
 import dev.opencode.client.data.parseFileChanges
@@ -46,6 +47,7 @@ data class ChatUiState(
     val streaming: Boolean = false,
     val sending: Boolean = false,
     val compacting: Boolean = false, // 正在压缩上下文
+    val connectionState: String = "connected", // SSE: connected / reconnecting / error
     val error: String? = null,
     // agent / model / 档位
     val agents: List<AgentInfo> = emptyList(),
@@ -84,6 +86,12 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     /** 流式渲染节流标记（16ms 合并刷新）。 */
     private var publishScheduled = false
+
+    /** 最近一次发送失败的内容（供重试）。 */
+    private var failedSend: Pair<String, List<FileAttachment>>? = null
+
+    /** 长会话只保留最近 N 条在内存中（避免上千条全部驻留导致卡顿）。 */
+    private val maxHistoryInMemory = 500
 
     /** mid -> blockKey -> Block；blockKey："t:<ordinal>" 文本 | "c:<callID>" 工具 */
     private val liveBlocks = LinkedHashMap<String, LinkedHashMap<String, Block>>()
@@ -135,15 +143,24 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     private fun startStream() {
         val s = server ?: return
         streamJob = viewModelScope.launch {
+            var connected = false
             while (isActive) {
                 try {
-                    EventStream(s).events().collect { handleEvent(it) }
+                    EventStream(s).events().collect { event ->
+                        if (!connected) {
+                            connected = true
+                            _ui.update { it.copy(connectionState = "connected") }
+                        }
+                        handleEvent(event)
+                    }
                 } catch (e: CancellationException) {
                     throw e
                 } catch (_: Exception) {
-                    // 断流：延迟重连并整页重拉补状态
+                    // 断流：标记状态并延迟重连
                 }
                 if (!isActive) break
+                connected = false
+                _ui.update { it.copy(connectionState = "reconnecting") }
                 delay(2000)
                 loadHistory()
             }
@@ -171,13 +188,24 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 }
                 commandsD.await().onSuccess { serverCommands ->
                     // 内置命令 + 服务器命令去重合并
-                    val builtin = listOf(CommandInfo("compact", "压缩会话上下文"))
+                    val builtin = listOf(
+                        CommandInfo("compact", "压缩会话上下文"),
+                        CommandInfo("mcps", "查看 MCP 服务器与工具"),
+                        CommandInfo("skills", "查看可用技能"),
+                    )
+                    val builtinNames = builtin.map { it.name }.toSet()
                     _ui.update {
-                        it.copy(commands = builtin + serverCommands.filter { c -> c.name != "compact" })
+                        it.copy(commands = builtin + serverCommands.filter { c -> c.name !in builtinNames })
                     }
                 }.onFailure {
                     _ui.update {
-                        it.copy(commands = listOf(CommandInfo("compact", "压缩会话上下文")))
+                        it.copy(
+                            commands = listOf(
+                                CommandInfo("compact", "压缩会话上下文"),
+                                CommandInfo("mcps", "查看 MCP 服务器与工具"),
+                                CommandInfo("skills", "查看可用技能"),
+                            )
+                        )
                     }
                 }
                 detailD.await().onSuccess { d ->
@@ -387,6 +415,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         val files = _ui.value.attachments
         _ui.update { it.copy(sending = true, error = null) }
         val localId = "local-${System.currentTimeMillis()}"
+        // 乐观上屏：发出去立刻显示，不等服务器
         _ui.update {
             it.copy(
                 messages = it.messages + ChatMessage(
@@ -402,9 +431,11 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                     _ui.update { st ->
                         st.copy(sending = false, messages = st.messages.filterNot { m -> m.id == localId })
                     }
-                    loadHistory()
+                    // 只刷新最近一页：全量翻页在长会话要 1~2 秒，是发送后卡顿的根因
+                    refreshRecent()
                 }
                 .onFailure { e ->
+                    failedSend = trimmed to files
                     _ui.update { st ->
                         st.copy(
                             sending = false,
@@ -414,6 +445,24 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                         )
                     }
                 }
+        }
+    }
+
+    /** 增量刷新：只拉最新一页消息合并进来（发送后、结束一轮时用），避免全量翻页阻塞。 */
+    private fun refreshRecent() {
+        val s = server ?: return
+        val sid = sessionID ?: return
+        viewModelScope.launch {
+            api.recentMessages(s, sid).onSuccess { recent ->
+                if (recent.isEmpty()) return@onSuccess
+                // 用最新一页替换尾部，头部历史保留（避免整表重建导致闪动）
+                val recentIds = recent.map { it.id }.toSet()
+                val head = history.filterNot { it.id in recentIds }
+                history = head + recent
+                historyIds = history.map { it.id }.toSet()
+                liveBlocks.keys.removeAll(historyIds)
+                publish()
+            }
         }
     }
 
@@ -427,6 +476,8 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         if (text.startsWith("/")) {
             val name = text.trimStart('/').substringBefore(' ')
             if (name == "compact") return api.compact(s, sid)
+            if (name == "mcps") return showMcps(s)
+            if (name == "skills") return showSkills(s)
             val known = _ui.value.commands.any { it.name == name }
             if (known) {
                 val args = text.trimStart('/').removePrefix(name).trim()
@@ -441,6 +492,50 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             }
         }
         return api.prompt(s, sid, text, files, st.currentAgent, selection)
+    }
+
+    /** `/mcps`：展示 MCP 服务器连接状态（客户端本地渲染，不发给模型）。 */
+    private suspend fun showMcps(s: RemoteServer): Result<Unit> {
+        val servers = api.mcpServers(s).getOrNull()
+        val info = buildString {
+            append("**MCP 服务器**\n\n")
+            if (servers.isNullOrEmpty()) {
+                append("未配置 MCP 服务器。\n")
+            } else {
+                servers.forEach { sv ->
+                    append("- `").append(sv.name).append("` · ").append(sv.status ?: "unknown").append('\n')
+                }
+            }
+        }
+        appendLocalNotice(info)
+        return Result.success(Unit)
+    }
+
+    /** `/skills`：展示已加载的技能。 */
+    private suspend fun showSkills(s: RemoteServer): Result<Unit> {
+        val list = api.skills(s).getOrNull()
+        val info = buildString {
+            append("**Skills**\n\n")
+            if (list.isNullOrEmpty()) {
+                append("未发现可用技能。\n")
+            } else {
+                list.forEach { sk ->
+                    append("- `").append(sk.name).append('`')
+                    sk.description?.takeIf { it.isNotBlank() }?.let { append(" · ").append(it) }
+                    append('\n')
+                }
+            }
+        }
+        appendLocalNotice(info)
+        return Result.success(Unit)
+    }
+
+    /** 本地提示：以合成消息形式插入当前会话视图（不发给模型，仅本地展示）。 */
+    private fun appendLocalNotice(text: String) {
+        val id = "local-notice-${System.currentTimeMillis()}"
+        history = history + ChatMessage(id, "assistant", listOf(Block.Text("text", text, 0)))
+        historyIds = historyIds + id
+        publish()
     }
 
     fun interrupt() {
@@ -485,6 +580,14 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun clearError() = _ui.update { it.copy(error = null) }
+
+    /** 重试上次失败的发送。 */
+    fun retryFailedSend() {
+        val (text, files) = failedSend ?: return
+        failedSend = null
+        _ui.update { it.copy(error = null, attachments = files) }
+        send(text)
+    }
 
     // ---------- SSE 事件处理 ----------
 
@@ -542,10 +645,12 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 val callId = data.str("id") ?: return
                 val inputObj = data["input"] as? JsonObject
                 toolStart.putIfAbsent(callId, event.created ?: System.currentTimeMillis())
+                val mcpTool = if (data.str("name") == "execute") extractMcpToolName(inputObj) else null
                 upsertTool(mid, callId) {
                     it.copy(
+                        name = if (mcpTool != null) "mcp" else it.name,
                         input = inputObj?.toString() ?: it.input,
-                        title = deriveToolTitle(inputObj) ?: it.title,
+                        title = mcpTool ?: deriveToolTitle(inputObj) ?: it.title,
                         // 真实开始执行：覆盖此前的 running 占位状态
                         state = "running",
                     )
@@ -699,7 +804,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 if (pendingUser.remove(inboxID) != null) {
                     pendingDelivery.remove(inboxID)
                     publish()
-                    loadHistory()
+                    refreshRecent()
                 }
             }
             "session.inbox.cancelled" -> {
@@ -716,7 +821,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             "session.execution.interrupted" -> {
                 // interrupted：用户点停止后服务器的收尾事件，必须复位 streaming
                 _ui.update { it.copy(streaming = false) }
-                loadHistory()
+                refreshRecent()
                 loadSessionDetail()
             }
             // 压缩上下文：给出明确进度与结果反馈
@@ -765,9 +870,18 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         val s = server ?: return
         val sid = sessionID ?: return
         viewModelScope.launch {
-            api.messages(s, sid).onSuccess { loaded ->
-                history = loaded
-                historyIds = loaded.map { it.id }.toSet()
+            // 首屏优先：第一页到手立即渲染，后台继续翻页补齐统计（B 方案）
+            api.messages(s, sid, onFirstPage = { firstPage ->
+                history = firstPage
+                historyIds = firstPage.map { it.id }.toSet()
+                liveBlocks.keys.removeAll(historyIds)
+                publish()
+            }).onSuccess { loaded ->
+                // 长会话只保留最近 N 条，避免上千条全部驻留内存
+                history = if (loaded.size > maxHistoryInMemory) {
+                    loaded.takeLast(maxHistoryInMemory)
+                } else loaded
+                historyIds = history.map { it.id }.toSet()
                 liveBlocks.keys.removeAll(historyIds)
                 // API 次数 = 该会话 assistant 消息数（stats.steps 是全局口径，不适用单会话）
                 val assistantCount = loaded.count { it.role == "assistant" }

@@ -2,20 +2,15 @@ package dev.opencode.client.ui.chat
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Check
@@ -109,10 +104,17 @@ fun ToolCallCard(call: ToolCall) {
                 if (hasDiff) {
                     val adds = call.fileChanges.sumOf { it.additions }
                     val dels = call.fileChanges.sumOf { it.deletions }
+                    // +n 绿色，-n 红色
                     Text(
-                        text = "+$adds -$dels",
+                        text = "+$adds",
                         style = MaterialTheme.typography.labelSmall,
                         color = Color(0xFF4ADE80)
+                    )
+                    Spacer(Modifier.width(3.dp))
+                    Text(
+                        text = "-$dels",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = Color(0xFFFF5C7A)
                     )
                     Spacer(Modifier.width(6.dp))
                 }
@@ -146,6 +148,11 @@ fun ToolCallCard(call: ToolCall) {
                             )
                         }
                         ToolSection("输出", call.output)
+                    }
+                    // MCP / code mode：代码通常很长，默认只显示输出，输入代码折叠到更矮的高度
+                    call.name == "mcp" -> {
+                        ToolSection("输出", call.output)
+                        ToolSection("代码", call.input, maxHeight = 90.dp)
                     }
                     else -> {
                         // read / grep / glob / task 等：参数 + 结果
@@ -187,7 +194,7 @@ private fun StatusIcon(state: String) {
 }
 
 @Composable
-private fun ToolSection(label: String, content: String?) {
+private fun ToolSection(label: String, content: String?, maxHeight: androidx.compose.ui.unit.Dp = 146.dp) {
     if (content.isNullOrBlank()) return
     val context = LocalContext.current
     Row(
@@ -223,7 +230,7 @@ private fun ToolSection(label: String, content: String?) {
         color = MaterialTheme.colorScheme.onSurface,
         modifier = Modifier
             .fillMaxWidth()
-            .heightIn(max = 146.dp)
+            .heightIn(max = maxHeight)
             .background(codeBackground(), MaterialTheme.shapes.small)
             .verticalScroll(rememberScrollState())
             .padding(8.dp)
@@ -237,9 +244,6 @@ private fun codeBackground(): Color =
 /** 统一 diff 渲染：+ 绿 / - 红 / @@ 青 / 头部灰。 */
 @Composable
 private fun DiffView(change: ToolFileChange) {
-    val green = Color(0xFF4ADE80)
-    val red = Color(0xFFFF5C7A)
-
     Column(modifier = Modifier.padding(top = 8.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text(
@@ -250,11 +254,7 @@ private fun DiffView(change: ToolFileChange) {
                 overflow = TextOverflow.Ellipsis,
                 modifier = Modifier.weight(1f)
             )
-            Text(
-                text = "+${change.additions} -${change.deletions}",
-                style = MaterialTheme.typography.labelSmall,
-                color = green
-            )
+            // 增删统计已在卡片头部显示，这里不再重复
         }
         Text(
             text = highlightedDiff(change.patch),

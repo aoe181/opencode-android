@@ -70,6 +70,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
@@ -120,6 +121,8 @@ fun ChatScreen(mainVm: MainViewModel) {
     // 普通布局 + 智能吸底：上翻阅读不打扰，回到底部恢复跟随
     val listState = rememberLazyListState()
     val autoScroll = remember { mutableStateOf(true) }
+    // 自己发消息时强制回到底部（即使之前在上翻阅读）
+    var forceScrollTrigger by remember { mutableStateOf(0) }
     LaunchedEffect(listState) {
         snapshotFlow {
             val info = listState.layoutInfo
@@ -127,11 +130,32 @@ fun ChatScreen(mainVm: MainViewModel) {
             last >= info.totalItemsCount - 2
         }.collect { atBottom -> autoScroll.value = atBottom }
     }
-    LaunchedEffect(state.messages.size, state.streaming) {
-        // 流式输出中始终跟随；非流式时尊重用户上翻（autoScroll 标记）
-        if (state.messages.isEmpty()) return@LaunchedEffect
-        if (state.streaming || autoScroll.value) {
+    // 流式/新增消息时平滑跟随；用 animateScrollToItem 避免瞬间跳动造成的"闪一下"
+    // 首次进入会话：优先恢复上次位置；没有记录则回到底部
+    var restoredOnce by remember(sessionId) { mutableStateOf(false) }
+    LaunchedEffect(state.messages.size) {
+        if (restoredOnce || state.messages.isEmpty()) return@LaunchedEffect
+        restoredOnce = true
+        val saved = mainVm.scrollPosition(sessionId)
+        if (saved != null && saved in 0 until state.messages.size) {
+            listState.scrollToItem(saved)
+        } else {
             listState.scrollToItem(state.messages.lastIndex)
+        }
+    }
+    // 离开会话时保存当前可见的第一条索引
+    DisposableEffect(sessionId) {
+        onDispose {
+            mainVm.saveScrollPosition(
+                sessionId,
+                listState.firstVisibleItemIndex
+            )
+        }
+    }
+    LaunchedEffect(state.messages.size, state.streaming, forceScrollTrigger) {
+        if (state.messages.isEmpty() || !restoredOnce) return@LaunchedEffect
+        if (state.streaming || autoScroll.value || forceScrollTrigger > 0) {
+            listState.animateScrollToItem(state.messages.lastIndex)
         }
     }
 
@@ -166,17 +190,22 @@ fun ChatScreen(mainVm: MainViewModel) {
                         .clickable { showSessionSwitcher = true }
                         .padding(vertical = 6.dp)
                 )
-                // 上下文占用指示器：分子=最近一次请求完整上下文(input+cache.read)，分母=模型上限
+                // 上下文占用指示器：>70% 显示橙色警示
                 state.contextTokens?.let { ctx ->
+                    val limit = state.models.firstOrNull {
+                        it.matches(state.currentProvider, state.currentModel)
+                    }?.contextLimit
+                    val pct = if (limit != null && limit > 0) (ctx * 100.0 / limit).toInt() else 0
                     Box {
                         Text(
                             text = contextLabel(state, ctx),
                             style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.primary,
+                            color = if (pct >= 70) Color(0xFFFFA726)
+                                    else MaterialTheme.colorScheme.primary,
                             maxLines = 1,
                             modifier = Modifier
                                 .clickable { showUsage = !showUsage }
-                                .padding(horizontal = 8.dp, vertical = 4.dp)
+                                .padding(horizontal = 6.dp, vertical = 4.dp)
                         )
                         DropdownMenu(
                             expanded = showUsage,
@@ -185,6 +214,28 @@ fun ChatScreen(mainVm: MainViewModel) {
                             UsageDetails(state)
                         }
                     }
+                }
+                // 连接状态：绿色对号 / 橙色圈（重连中） / 红色叉
+                val connColor = when (state.connectionState) {
+                    "connected" -> Color(0xFF4ADE80)
+                    "reconnecting" -> Color(0xFFFFA726)
+                    else -> Color(0xFFFF5C7A)
+                }
+                Box(
+                    modifier = Modifier
+                        .size(14.dp)
+                        .padding(end = 2.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        text = when (state.connectionState) {
+                            "connected" -> "✓"
+                            "reconnecting" -> "○"
+                            else -> "✕"
+                        },
+                        style = MaterialTheme.typography.labelMedium,
+                        color = connColor
+                    )
                 }
             }
         }
@@ -243,12 +294,30 @@ fun ChatScreen(mainVm: MainViewModel) {
             }
 
             state.error?.let { err ->
-                Text(
-                    text = err,
-                    color = MaterialTheme.colorScheme.error,
-                    style = MaterialTheme.typography.bodySmall,
-                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 2.dp)
-                )
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 10.dp, vertical = 2.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = err,
+                        color = MaterialTheme.colorScheme.error,
+                        style = MaterialTheme.typography.bodySmall,
+                        modifier = Modifier.weight(1f)
+                    )
+                    // 发送失败可一键重试
+                    if (err.startsWith("发送失败")) {
+                        Text(
+                            text = "重试",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier
+                                .clickable { chatVm.retryFailedSend() }
+                                .padding(horizontal = 8.dp, vertical = 2.dp)
+                        )
+                    }
+                }
             }
             // 压缩上下文的进度提示
             if (state.compacting) {
@@ -401,6 +470,9 @@ fun ChatScreen(mainVm: MainViewModel) {
                             chatVm.send(input)
                             input = ""
                             mainVm.saveDraft(sessionId, "")
+                            // 自己发消息：强制回到底部
+                            autoScroll.value = true
+                            forceScrollTrigger++
                         },
                         enabled = !state.sending && input.isNotBlank()
                     ) {
@@ -623,7 +695,13 @@ fun ChatScreen(mainVm: MainViewModel) {
                     .padding(start = 16.dp, end = 16.dp, bottom = 24.dp)
             ) {
                 Text(
-                    text = if (message?.role == "user") "这条输入" else "这条回复",
+                    text = buildString {
+                        append(if (message?.role == "user") "这条输入" else "这条回复")
+                        message?.timestampMs?.let { ts ->
+                            append("  ·  ")
+                            append(formatTimestamp(ts))
+                        }
+                    },
                     style = MaterialTheme.typography.titleSmall,
                     modifier = Modifier.padding(bottom = 4.dp)
                 )
@@ -635,6 +713,25 @@ fun ChatScreen(mainVm: MainViewModel) {
                     )
                     Toast.makeText(context, "已复制", Toast.LENGTH_SHORT).show()
                     actionMessage = null
+                }
+                // 复制消息里的代码块（``` 围栏内内容）
+                val codeBlocks = message?.blocks
+                    ?.filterIsInstance<dev.opencode.client.data.Block.Text>()
+                    ?.filter { it.type == "text" }
+                    ?.flatMap { b -> extractCodeBlocks(b.text) }
+                    .orEmpty()
+                if (codeBlocks.isNotEmpty()) {
+                    SheetAction(
+                        if (codeBlocks.size == 1) "复制代码" else "复制代码（${codeBlocks.size} 段）"
+                    ) {
+                        val clipboard =
+                            context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                        clipboard.setPrimaryClip(
+                            ClipData.newPlainText("opencode-code", codeBlocks.joinToString("\n\n"))
+                        )
+                        Toast.makeText(context, "已复制代码", Toast.LENGTH_SHORT).show()
+                        actionMessage = null
+                    }
                 }
                 if (message != null && message.id in state.pendingInputs) {
                     SheetAction("撤回这条输入") {
@@ -975,4 +1072,36 @@ private fun ImagePreview(image: MessageImage) {
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
     }
+}
+
+/** 从 Markdown 中提取 ``` 围栏代码块内容。 */
+private fun extractCodeBlocks(markdown: String): List<String> {
+    val out = mutableListOf<String>()
+    val sb = StringBuilder()
+    var inFence = false
+    markdown.lineSequence().forEach { line ->
+        if (line.trimStart().startsWith("```")) {
+            if (inFence) {
+                out += sb.toString().trimEnd()
+                sb.clear()
+            }
+            inFence = !inFence
+        } else if (inFence) {
+            if (sb.isNotEmpty()) sb.append('\n')
+            sb.append(line)
+        }
+    }
+    return out.filter { it.isNotBlank() }
+}
+
+/** 时间戳格式化（当天显示时分，跨天显示月日时分）。 */
+private fun formatTimestamp(ms: Long): String {
+    val now = java.util.Calendar.getInstance()
+    val then = java.util.Calendar.getInstance().apply { timeInMillis = ms }
+    val sameDay = now.get(java.util.Calendar.YEAR) == then.get(java.util.Calendar.YEAR) &&
+        now.get(java.util.Calendar.DAY_OF_YEAR) == then.get(java.util.Calendar.DAY_OF_YEAR)
+    return java.text.SimpleDateFormat(
+        if (sameDay) "HH:mm" else "MM-dd HH:mm",
+        java.util.Locale.getDefault()
+    ).format(java.util.Date(ms))
 }

@@ -16,12 +16,15 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
+import kotlinx.coroutines.launch
 import dev.opencode.client.ui.ConnectScreen
 import dev.opencode.client.ui.SessionsScreen
 import dev.opencode.client.ui.chat.ChatScreen
@@ -33,15 +36,20 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         setContent {
-            // 夜间模式默认开启（品牌主形态），会话页可切换
+            val themeStore = remember { dev.opencode.client.data.SettingsStore(applicationContext) }
+            val scope = rememberCoroutineScope()
+            // 夜间模式：从 DataStore 读取（默认深色），切换后立即持久化
             var darkMode by remember { mutableStateOf(true) }
+            LaunchedEffect(Unit) { darkMode = themeStore.loadDarkTheme() }
             OpenCodeClientTheme(darkTheme = darkMode) {
                 val vm: MainViewModel = viewModel()
                 val state by vm.uiState.collectAsState()
                 val selected by vm.selected.collectAsState()
-                // 主题开关通过 MainUiState 传递到会话页：用 CompositionLocal 简化
                 androidx.compose.runtime.CompositionLocalProvider(
-                    LocalThemeToggle provides { darkMode = !darkMode }
+                    LocalThemeToggle provides {
+                        darkMode = !darkMode
+                        scope.launch { themeStore.saveDarkTheme(darkMode) }
+                    }
                 ) {
                     // imePadding：键盘弹出时整体上移，聊天输入栏不被遮挡
                     Box(

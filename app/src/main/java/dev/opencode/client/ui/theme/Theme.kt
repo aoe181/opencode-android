@@ -21,17 +21,24 @@ private val DarkColors = darkColorScheme(
     tertiary = Green,
     // 层级对比拉大 + 整体压暗（用户反馈白色区域太亮）
     background = Color(0xFF050609),
-    onBackground = Color(0xFFA8AEBA),
-    surface = Color(0xFF0C0E13),
-    onSurface = Color(0xFFA8AEBA),
-    surfaceVariant = Color(0xFF151920),
-    onSurfaceVariant = Color(0xFF727B8C),
+    onBackground = Color(0xFF9BA3B0),
+    surface = Color(0xFF0B0D12),
+    onSurface = Color(0xFF9BA3B0),
+    surfaceVariant = Color(0xFF14181F),
+    onSurfaceVariant = Color(0xFF6B7383),
     surfaceTint = Color.Transparent,
+    // 对话框/菜单底色压暗，避免弹层发白
+    surfaceContainerHigh = Color(0xFF10141A),
+    surfaceContainerHighest = Color(0xFF161B23),
+    surfaceContainer = Color(0xFF0D1015),
+    surfaceContainerLow = Color(0xFF0A0C10),
+    surfaceContainerLowest = Color(0xFF050609),
     error = Color(0xFFFF5C7A),
     onError = Color(0xFF2B040D),
-    outlineVariant = Color(0xFF2A313E),
-    inverseSurface = Color(0xFFB4BAC6),
-    inverseOnSurface = Color(0xFF07080B),
+    outline = Color(0xFF39414F),
+    outlineVariant = Color(0xFF242A34),
+    inverseSurface = Color(0xFF9BA3B0),
+    inverseOnSurface = Color(0xFF050609),
 )
 
 private val LightColors = lightColorScheme(
