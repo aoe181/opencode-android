@@ -1,5 +1,6 @@
 package dev.opencode.client.data
 
+import androidx.compose.runtime.Immutable
 import dev.opencode.client.ui.chat.AnsiStripper
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
@@ -11,6 +12,7 @@ import kotlinx.serialization.json.JsonPrimitive
  */
 sealed class Block {
     /** type: "text" 正文 | "reasoning" 思考过程（durationMs 仅 reasoning 有值） */
+    @Immutable
     data class Text(
         val type: String,
         val text: String,
@@ -18,6 +20,7 @@ sealed class Block {
         val durationMs: Long? = null,
     ) : Block()
 
+    @Immutable
     data class Tool(val call: ToolCall) : Block()
 }
 
@@ -27,6 +30,7 @@ sealed class Block {
  * 摘要由服务器生成并自动注入后续对话上下文（包成 <conversation-checkpoint>），
  * App 只负责展示，不参与注入。
  */
+@Immutable
 data class CompactionInfo(
     val summary: String,
     val reason: String? = null,
@@ -34,6 +38,7 @@ data class CompactionInfo(
     val keptMessages: Int? = null,
 )
 
+@Immutable
 data class ToolFileChange(
     val file: String,
     val patch: String,
@@ -42,6 +47,7 @@ data class ToolFileChange(
     val deletions: Int,
 )
 
+@Immutable
 data class ToolCall(
     val id: String,
     val name: String,
@@ -58,6 +64,7 @@ data class ToolCall(
     val shellID: String? = null, // 关联的 shell 会话（后台命令可据此追踪）
 )
 
+@Immutable
 data class ChatMessage(
     val id: String,
     val role: String, // "user" | "assistant"
@@ -93,6 +100,7 @@ data class ShellResult(
 )
 
 /** 路径引用的附件（服务器侧文件，Web 渲染为附件芯片）。 */
+@Immutable
 data class MessageAttachment(
     val name: String,
     val mime: String,
@@ -100,6 +108,7 @@ data class MessageAttachment(
 )
 
 /** 消息里的内联图片（base64，渲染为缩略图）。 */
+@Immutable
 data class MessageImage(
     val base64: String,
     val mime: String,

@@ -69,6 +69,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
@@ -78,6 +79,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalContext
@@ -87,7 +90,9 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import dev.opencode.client.MainViewModel
 import dev.opencode.client.data.Block
 import dev.opencode.client.data.ChatMessage
@@ -125,18 +130,19 @@ fun ChatScreen(mainVm: MainViewModel) {
         if (uri != null) chatVm.onPicked(uri)
     }
 
-    // 普通布局 + 智能吸底：上翻阅读不打扰，回到底部恢复跟随
+    // 普通布局 + 智能吸底。
+    //
+    // 跟随模式（autoScroll）下，列表尾部始终贴住输入框：流式文本增长、新消息、
+    // 工具卡片展开、键盘弹出导致视口变矮，都会重新贴底。之前只在消息数量变化时
+    // 滚一次，所以键盘弹起后最后一条会被输入框盖住（"尾部不跟着起来"）。
+    // 用户手指一拖就退出跟随，拖回底部再恢复，上翻阅读不被打断。
     val listState = rememberLazyListState()
     val autoScroll = remember { mutableStateOf(true) }
+    // 手指是否正按在列表上（程序化滚动不会置位，用来区分用户意图）
+    var userTouching by remember { mutableStateOf(false) }
     // 自己发消息时强制回到底部（即使之前在上翻阅读）
     var forceScrollTrigger by remember { mutableStateOf(0) }
-    LaunchedEffect(listState) {
-        snapshotFlow {
-            val info = listState.layoutInfo
-            val last = info.visibleItemsInfo.lastOrNull()?.index ?: -1
-            last >= info.totalItemsCount - 2
-        }.collect { atBottom -> autoScroll.value = atBottom }
-    }
+
     // 首次进入会话：优先恢复上次位置；没有记录则回到底部
     var restoredOnce by remember(sessionId) { mutableStateOf(false) }
     // 视口锚点：记录首条可见消息的 id 与偏移。
@@ -144,6 +150,57 @@ fun ChatScreen(mainVm: MainViewModel) {
     // 视口内容会瞬间变成"上面"的消息——这就是进入会话/发送时屏幕向上跳的原因。
     var anchorId by remember(sessionId) { mutableStateOf<String?>(null) }
     var anchorOffset by remember(sessionId) { mutableStateOf(0) }
+
+    // 是否真的在底部：最后一条完整可见（8px 容差，避免像素误差反复切换）
+    fun atBottom(): Boolean {
+        val info = listState.layoutInfo
+        val last = info.visibleItemsInfo.lastOrNull() ?: return true
+        if (last.index != info.totalItemsCount - 1) return false
+        return last.offset + last.size <= info.viewportEndOffset + 8
+    }
+
+    // 贴到底：先定位到末条，再向前多滚一点（会被钳制在内容末尾）。
+    // 只用 scrollToItem 会把末条的"顶部"对齐到视口顶部，
+    // 长消息时新内容仍在屏幕外，必须再补一次到底。
+    suspend fun stickToBottom() {
+        val last = listState.layoutInfo.totalItemsCount - 1
+        if (last < 0) return
+        listState.scrollToItem(last)
+        listState.scrollBy(BOTTOM_SCROLL_OVERSHOOT)
+    }
+
+    LaunchedEffect(listState) {
+        snapshotFlow { listState.isScrollInProgress }
+            .collect { scrolling ->
+                if (scrolling && userTouching) {
+                    // 手指拖动中实时判断：一离开底部就停止跟随
+                    autoScroll.value = atBottom()
+                } else if (!scrolling && !userTouching && atBottom()) {
+                    // 松手/惯性结束回到底部：恢复跟随
+                    autoScroll.value = true
+                }
+            }
+    }
+
+    // 贴底引擎：布局每变化一次就检查尾部是否露出，不够就补滚。
+    // 键盘弹出（视口变矮）、流式文本增长、新消息都走这里，尾部始终跟着输入框。
+    LaunchedEffect(listState) {
+        snapshotFlow { listState.layoutInfo }
+            .collect { info ->
+                if (!autoScroll.value || userTouching || !restoredOnce) return@collect
+                val lastIndex = info.totalItemsCount - 1
+                if (lastIndex < 0) return@collect
+                val lastVisible = info.visibleItemsInfo.lastOrNull() ?: return@collect
+                if (lastVisible.index != lastIndex) {
+                    // 下方还有没露出来的条目：直接贴到底
+                    stickToBottom()
+                    return@collect
+                }
+                val delta = info.viewportEndOffset - (lastVisible.offset + lastVisible.size)
+                if (delta < 0) listState.scrollBy(-delta.toFloat())
+            }
+    }
+
     LaunchedEffect(listState) {
         snapshotFlow {
             val info = listState.layoutInfo.visibleItemsInfo.firstOrNull()
@@ -175,7 +232,7 @@ fun ChatScreen(mainVm: MainViewModel) {
                 // 恢复到非底部位置时立即关掉吸底，否则后台分页完成后会被拉到底部
                 autoScroll.value = restoredIndex >= state.messages.lastIndex - 1
             } else {
-                listState.scrollToItem(state.messages.lastIndex)
+                stickToBottom()
             }
             return@LaunchedEffect
         }
@@ -187,8 +244,7 @@ fun ChatScreen(mainVm: MainViewModel) {
                 listState.scrollToItem(idx, anchorOffset)
             }
         }
-        // 吸底时跟随新消息
-        if (autoScroll.value) listState.scrollToItem(state.messages.lastIndex)
+        // 吸底跟随交给上面的贴底引擎（它连流式增长一起处理）
     }
     // 离开会话时保存视口锚点：仅在上翻阅读时保存（吸底时无需记忆，
     // 恢复时直接回到底部——否则从底部切走再回来会落在视口顶部而非底部）
@@ -199,11 +255,11 @@ fun ChatScreen(mainVm: MainViewModel) {
             }
         }
     }
-    LaunchedEffect(state.streaming, forceScrollTrigger) {
-        if (state.messages.isEmpty() || !restoredOnce) return@LaunchedEffect
-        if (state.streaming || autoScroll.value || forceScrollTrigger > 0) {
-            listState.animateScrollToItem(state.messages.lastIndex)
-        }
+    LaunchedEffect(forceScrollTrigger) {
+        if (forceScrollTrigger <= 0 || state.messages.isEmpty() || !restoredOnce) return@LaunchedEffect
+        // 自己发消息：强制回到底部（即使之前在上翻阅读）
+        autoScroll.value = true
+        stickToBottom()
     }
 
     Scaffold(
@@ -314,14 +370,27 @@ fun ChatScreen(mainVm: MainViewModel) {
             Box(modifier = Modifier.weight(1f)) {
             LazyColumn(
                 state = listState,
-                modifier = Modifier.fillMaxSize(),
+                modifier = Modifier
+                    .fillMaxSize()
+                    // 只观察不消费：记录手指是否按在列表上，用于区分
+                    // "用户上翻" 与 "程序化贴底"，避免流式时把用户顶回去
+                    .pointerInput(Unit) {
+                        awaitPointerEventScope {
+                            while (true) {
+                                val event = awaitPointerEvent(PointerEventPass.Initial)
+                                val pressed = event.changes.any { it.pressed }
+                                if (pressed != userTouching) userTouching = pressed
+                            }
+                        }
+                    },
                 contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 items(state.messages, key = { it.id }) { message ->
                     MessageBubble(
                         message = message,
-                        onLongPress = { actionMessage = message },
+                        // 只捕获状态写入器（稳定），避免每条消息每帧生成新 lambda
+                        onLongPress = { actionMessage = it },
                         // 只有正在流式增长的最后一条 assistant 消息才降级表格渲染
                         streaming = state.streaming && message.id == state.messages.lastOrNull()?.id,
                         pendingDelivery = state.pendingDeliveries[message.id],
@@ -356,7 +425,7 @@ fun ChatScreen(mainVm: MainViewModel) {
                         onClick = {
                             autoScroll.value = true
                             scope.launch {
-                                if (state.messages.isNotEmpty()) listState.scrollToItem(state.messages.lastIndex)
+                                if (state.messages.isNotEmpty()) stickToBottom()
                             }
                         },
                         shape = CircleShape,
@@ -1477,7 +1546,7 @@ private fun CompactionCard(info: dev.opencode.client.data.CompactionInfo) {
 @Composable
 private fun MessageBubble(
     message: ChatMessage,
-    onLongPress: () -> Unit,
+    onLongPress: (ChatMessage) -> Unit,
     streaming: Boolean = false,
     pendingDelivery: String? = null,
 ) {
@@ -1531,7 +1600,7 @@ private fun MessageBubble(
                             shape = MaterialTheme.shapes.medium,
                             modifier = Modifier
                                 .widthIn(max = 300.dp)
-                                .combinedClickable(onClick = {}, onLongClick = onLongPress)
+                                .combinedClickable(onClick = {}, onLongClick = { onLongPress(message) })
                         ) {
                             Text(
                                 text = message.textContent(),
@@ -1562,7 +1631,7 @@ private fun MessageBubble(
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .combinedClickable(onClick = {}, onLongClick = onLongPress),
+                .combinedClickable(onClick = {}, onLongClick = { onLongPress(message) }),
             verticalArrangement = Arrangement.spacedBy(6.dp)
         ) {
             message.blocks.forEach { block ->
@@ -1634,25 +1703,29 @@ private fun ReasoningBlock(messageId: String, ordinal: Int, text: String, durati
 /** 消息内图片缩略图（base64 解码，限制尺寸）。 */
 @Composable
 private fun ImagePreview(image: MessageImage) {
-    val bitmap = remember(image.base64) {
-        runCatching {
-            val bytes = android.util.Base64.decode(image.base64, android.util.Base64.DEFAULT)
-            val bmp = android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-            if (bmp != null) {
-                val maxSide = 720
-                val scale = minOf(maxSide.toFloat() / bmp.width, maxSide.toFloat() / bmp.height, 1f)
-                if (scale < 1f) {
-                    val scaled = android.graphics.Bitmap.createScaledBitmap(
-                        bmp,
-                        (bmp.width * scale).toInt().coerceAtLeast(1),
-                        (bmp.height * scale).toInt().coerceAtLeast(1),
-                        true
-                    )
-                    bmp.recycle()
-                    scaled
-                } else bmp
-            } else null
-        }.getOrNull()
+    // 解码放到后台线程：之前用 remember { decode } 在组合阶段同步解码，
+    // 一张 720px 的图会卡住整帧（滚动时明显掉帧）。produceState 先出占位再替换。
+    val bitmap by produceState<android.graphics.Bitmap?>(initialValue = null, image.base64) {
+        value = withContext(Dispatchers.Default) {
+            runCatching {
+                val bytes = android.util.Base64.decode(image.base64, android.util.Base64.DEFAULT)
+                val bmp = android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                if (bmp != null) {
+                    val maxSide = 720
+                    val scale = minOf(maxSide.toFloat() / bmp.width, maxSide.toFloat() / bmp.height, 1f)
+                    if (scale < 1f) {
+                        val scaled = android.graphics.Bitmap.createScaledBitmap(
+                            bmp,
+                            (bmp.width * scale).toInt().coerceAtLeast(1),
+                            (bmp.height * scale).toInt().coerceAtLeast(1),
+                            true
+                        )
+                        bmp.recycle()
+                        scaled
+                    } else bmp
+                } else null
+            }.getOrNull()
+        }
     }
     if (bitmap != null) {
         Image(
@@ -1704,3 +1777,6 @@ private fun formatTimestamp(ms: Long): String {
         java.util.Locale.getDefault()
     ).format(java.util.Date(ms))
 }
+
+/** 贴底时多滚一点：LazyList 会把超出内容末尾的滚动量钳制掉，用它等价于"滚到底"。 */
+private const val BOTTOM_SCROLL_OVERSHOOT = 100_000f

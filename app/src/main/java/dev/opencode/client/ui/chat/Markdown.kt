@@ -35,6 +35,8 @@ fun MarkdownText(
     val markwonNoTables = remember(context, dark) { cachedMarkwon(context, dark, withTables = false) }
     val hasTable = remember(markdown) { looksLikeTable(markdown) }
     val usePlain = streaming && hasTable
+    // 流式期间限制重渲染频率（Markwon 每次都要整段重新解析，32ms 一帧太贵）
+    val lastRenderAt = remember { longArrayOf(0L) }
     AndroidView(
         modifier = modifier,
         factory = { ctx ->
@@ -52,6 +54,10 @@ fun MarkdownText(
             // 块（尤其是表格）也会被反复 setMarkdown + 整段重排，造成闪烁。
             val key = "$usePlain\u0000${markdown.length}\u0000${markdown.hashCode()}"
             if (tv.tag != key) {
+                // 流式增长时最多每 100ms 重新解析一次；结束（streaming=false）立刻补渲染
+                val now = android.os.SystemClock.uptimeMillis()
+                if (streaming && now - lastRenderAt[0] < STREAM_RENDER_INTERVAL_MS) return@update
+                lastRenderAt[0] = now
                 tv.tag = key
                 val renderer = if (usePlain) markwonNoTables else markwon
                 renderer.setMarkdown(tv, markdown)
@@ -129,3 +135,6 @@ private fun looksLikeTable(markdown: String): Boolean {
 
 /** 超过该长度时，只在代码块闭合（``` 结尾）才重新染色，避免流式期间每帧全量扫描。 */
 private const val HIGHLIGHT_SYNC_LIMIT = 1500
+
+/** 流式期间 Markdown 重解析的最小间隔（毫秒）。 */
+private const val STREAM_RENDER_INTERVAL_MS = 100L
