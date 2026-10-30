@@ -56,14 +56,16 @@ fun MarkdownText(
             if (tv.tag != key) {
                 // 流式增长时最多每 100ms 重新解析一次；结束（streaming=false）立刻补渲染
                 val now = android.os.SystemClock.uptimeMillis()
-                if (streaming && now - lastRenderAt[0] < STREAM_RENDER_INTERVAL_MS) return@update
-                lastRenderAt[0] = now
-                tv.tag = key
-                val renderer = if (usePlain) markwonNoTables else markwon
-                renderer.setMarkdown(tv, markdown)
-                // 语法染色是纯 CPU 遍历，流式时文本增长很快；长文本降频以免抢主线程帧时间
-                if (markdown.length <= HIGHLIGHT_SYNC_LIMIT || markdown.endsWith("```")) {
-                    Highlighter.apply(tv)
+                val throttled = streaming && now - lastRenderAt[0] < STREAM_RENDER_INTERVAL_MS
+                if (!throttled) {
+                    lastRenderAt[0] = now
+                    tv.tag = key
+                    val renderer = if (usePlain) markwonNoTables else markwon
+                    renderer.setMarkdown(tv, markdown)
+                    // 语法染色是纯 CPU 遍历，流式时文本增长很快；长文本降频以免抢主线程帧时间
+                    if (markdown.length <= HIGHLIGHT_SYNC_LIMIT || markdown.endsWith("```")) {
+                        Highlighter.apply(tv)
+                    }
                 }
             }
         }

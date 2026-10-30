@@ -13,6 +13,7 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -1727,9 +1728,10 @@ private fun ImagePreview(image: MessageImage) {
             }.getOrNull()
         }
     }
-    if (bitmap != null) {
+    val bmp = bitmap
+    if (bmp != null) {
         Image(
-            bitmap = bitmap.asImageBitmap(),
+            bitmap = bmp.asImageBitmap(),
             contentDescription = image.name ?: "图片",
             contentScale = ContentScale.Fit,
             modifier = Modifier
