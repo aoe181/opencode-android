@@ -1,3 +1,5 @@
+import java.util.Base64
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
@@ -37,7 +39,7 @@ android {
             if (ksB64 != null) {
                 val ksFile = File("${System.getenv("SIGNING_TMP_DIR") ?: "."}/release.keystore")
                 ksFile.parentFile?.mkdirs()
-                ksFile.writeBytes(java.util.Base64.getDecoder().decode(ksB64))
+                ksFile.writeBytes(Base64.getDecoder().decode(ksB64))
                 signingConfigs {
                     create("release") {
                         storeFile = ksFile
