@@ -303,9 +303,43 @@ private fun parseToolPart(obj: JsonObject, index: Int, shellResults: Map<String,
 internal fun extractMcpToolName(input: JsonObject?): String? {
     val code = input?.str("code") ?: return null
     MCP_TOOL_BRACKET_REGEX.find(code)?.let { return it.groupValues[2] }
-    MCP_TOOL_DOT_REGEX.find(code)?.let { return it.groupValues[1] }
+    // 点号写法：第 1 组是服务器名（local-mcp），第 2 组才是工具名
+    MCP_TOOL_DOT_REGEX.find(code)?.let { return it.groupValues[2] }
     MCP_BUILTIN_DOT_REGEX.find(code)?.let { return it.groupValues[1] }
     return null
+}
+
+/**
+ * 从**原始文本**里提取 MCP 工具名，可在流式分片（JSON 尚不完整）阶段使用。
+ *
+ * 实时事件送来的 input 是 JSON 文本，引号被转义成 `\"`，直接跑正则会失配；
+ * 这里先把 `\"` 还原成 `"` 再匹配，因此不需要完整合法的 JSON 也能提前识别。
+ */
+internal fun extractMcpToolNameFromText(raw: String?): String? {
+    if (raw.isNullOrBlank()) return null
+    // 完整 JSON 优先（能正确还原 JSON 字符串里的转义）
+    parseToolInput(raw)?.let { obj -> extractMcpToolName(obj)?.let { return it } }
+    // 分片阶段：还原转义后直接匹配。
+    // 注意此时工具名可能还没写完（如 mt_apk_worksp），后面必须紧跟非标识符字符才算完整，
+    // 否则先返回 null，等下一个分片。
+    val text = raw.replace("\\\"", "\"")
+    MCP_TOOL_BRACKET_REGEX.find(text)?.let { m ->
+        if (isCompleteIdent(text, m.range.last + 1)) return m.groupValues[2]
+    }
+    MCP_TOOL_DOT_REGEX.find(text)?.let { m ->
+        if (isCompleteIdent(text, m.range.last + 1)) return m.groupValues[2]
+    }
+    MCP_BUILTIN_DOT_REGEX.find(text)?.let { m ->
+        if (isCompleteIdent(text, m.range.last + 1)) return m.groupValues[1]
+    }
+    return null
+}
+
+/** 工具名后面必须是非标识符字符（`(` / `[` / 空白 / 引号等），才认为名字已完整。 */
+private fun isCompleteIdent(text: String, indexAfterName: Int): Boolean {
+    if (indexAfterName >= text.length) return false
+    val c = text[indexAfterName]
+    return !(c.isLetterOrDigit() || c == '_')
 }
 
 /**

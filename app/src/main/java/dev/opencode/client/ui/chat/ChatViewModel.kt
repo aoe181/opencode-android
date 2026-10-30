@@ -23,6 +23,7 @@ import dev.opencode.client.data.ToolCall
 import dev.opencode.client.data.deriveToolTitle
 import dev.opencode.client.data.extractMcpToolName
 import dev.opencode.client.data.extractMcpToolNameFromRaw
+import dev.opencode.client.data.extractMcpToolNameFromText
 import dev.opencode.client.data.inferToolNameFromInput
 import dev.opencode.client.data.parseToolInput
 import dev.opencode.client.data.joinContentText
@@ -695,27 +696,39 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 val mid = data.str("assistantMessageID") ?: return
                 val callId = data.str("id") ?: return
                 val delta = data.str("delta") ?: data.str("text") ?: return
-                upsertTool(mid, callId) { it.copy(input = (it.input ?: "") + delta) }
+                upsertTool(mid, callId) { cur ->
+                    val merged = (cur.input ?: "") + delta
+                    // 输入边到达边尝试识别：一旦 code 里出现 tools["srv"].toolName，
+                    // 立刻把卡片从 execute 切到 mcp + 真实工具名，不必等 input.ended
+                    val mcpTool = if (cur.name == "execute" || cur.name == "tool") {
+                        extractMcpToolNameFromText(merged)
+                    } else null
+                    cur.copy(
+                        input = merged,
+                        name = if (mcpTool != null) "mcp" else cur.name,
+                        title = mcpTool ?: cur.title,
+                    )
+                }
                 publish()
             }
             "session.tool.input.ended" -> {
                 val mid = data.str("assistantMessageID") ?: return
                 val callId = data.str("id") ?: return
                 val text = data.str("text") ?: return
-                // 输入完整到手：此时才能可靠解析出真实工具名（MCP 工具只在这时可见）
-                val declared = data.str("name")
-                val mcpTool = if (declared == "execute" || declared == null) {
-                    extractMcpToolNameFromRaw(text)
-                } else null
+                // 输入完整到手：用完整文本重新识别（input.delta 阶段可能只拿到部分）
+                val mcpTool = extractMcpToolNameFromRaw(text)
                 upsertTool(mid, callId) {
                     it.copy(
                         input = text,
                         name = when {
                             mcpTool != null -> "mcp"
+                            // 已经是 mcp 的保持（delta 阶段已识别，完整文本解析失败也不回退）
+                            it.name == "mcp" -> "mcp"
                             it.name == "tool" || it.name == "execute" ->
                                 inferToolNameFromInput(parseToolInput(text)) ?: it.name
                             else -> it.name
                         },
+                        // 已识别过的 title 不回退成 null
                         title = mcpTool ?: it.title,
                     )
                 }
