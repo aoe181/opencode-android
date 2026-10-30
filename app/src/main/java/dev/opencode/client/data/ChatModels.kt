@@ -1,0 +1,501 @@
+package dev.opencode.client.data
+
+import dev.opencode.client.ui.chat.AnsiStripper
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+
+/**
+ * 消息内容块：文本（正文/思考）与工具调用按原始顺序穿插。
+ */
+sealed class Block {
+    /** type: "text" 正文 | "reasoning" 思考过程（durationMs 仅 reasoning 有值） */
+    data class Text(
+        val type: String,
+        val text: String,
+        val ordinal: Int,
+        val durationMs: Long? = null,
+    ) : Block()
+
+    data class Tool(val call: ToolCall) : Block()
+}
+
+data class ToolFileChange(
+    val file: String,
+    val patch: String,
+    val status: String,
+    val additions: Int,
+    val deletions: Int,
+)
+
+data class ToolCall(
+    val id: String,
+    val name: String,
+    val state: String, // "running" | "success" | "failed"
+    val title: String? = null,    // 输入摘要（bash 命令 / 文件路径等）
+    val input: String? = null,    // 原始输入 JSON 文本
+    val output: String? = null,   // 执行输出
+    val exit: Int? = null,
+    val durationMs: Long? = null, // 执行耗时
+    val truncated: Boolean = false,
+    val fileChanges: List<ToolFileChange> = emptyList(), // edit 类工具的 diff
+    val timestampMs: Long? = null, // 消息创建时间（无耗时时显示时刻）
+    val background: Boolean = false, // 命令转入后台继续运行（非完成态）
+    val shellID: String? = null, // 关联的 shell 会话（后台命令可据此追踪）
+)
+
+data class ChatMessage(
+    val id: String,
+    val role: String, // "user" | "assistant"
+    val blocks: List<Block>,
+    val totalTokens: Long? = null, // 官方 contextUsage 分子（assistant 带 tokens 时）
+    val images: List<MessageImage> = emptyList(), // user 消息附带的图片（内联 base64）
+    val attachments: List<MessageAttachment> = emptyList(), // 路径引用的附件（Web 的 metadata.attachments）
+) {
+    fun textContent(): String =
+        blocks.filterIsInstance<Block.Text>()
+            .filter { it.type == "text" }
+            .joinToString("\n") { it.text }
+
+    /** 长按复制用的纯文本。 */
+    fun plainText(): String = blocks.mapNotNull { block ->
+        when (block) {
+            is Block.Text -> block.text
+            is Block.Tool -> block.call.title?.let { title -> "${block.call.name}: $title" }
+        }
+    }.joinToString("\n\n")
+}
+
+/** shell 命令的最终结果（来自 synthetic 回执，后台命令跑完后只在这里）。 */
+data class ShellResult(
+    val output: String,
+    val exit: Int?,
+    val state: String,
+    val truncated: Boolean,
+    val completedAt: Long?,
+)
+
+/** 路径引用的附件（服务器侧文件，Web 渲染为附件芯片）。 */
+data class MessageAttachment(
+    val name: String,
+    val mime: String,
+    val path: String,
+)
+
+/** 消息里的内联图片（base64，渲染为缩略图）。 */
+data class MessageImage(
+    val base64: String,
+    val mime: String,
+    val name: String?,
+)
+
+/**
+ * 附件（Web 同款语义）：
+ * - 已上传到服务器时：uri = "file://<服务器绝对路径>"（模型/工具按路径读取）
+ * - 兜底内联时：uri = "data:<mime>;base64,..."
+ */
+data class FileAttachment(
+    val uri: String,
+    val name: String,
+    val mime: String = "application/octet-stream",
+    /** 服务器侧绝对路径（文件上传成功后填写）。 */
+    val serverPath: String? = null,
+    /** 图片走内联 dataUrl（Web 同款），文件走路径引用。 */
+    val isImage: Boolean = false,
+)
+
+/** 选中的模型与档位（提交时随 metadata 下发，与 Web 端 admission.metadata.model 一致）。 */
+data class ModelSelection(
+    val providerID: String,
+    val modelID: String,
+    val variant: String? = null,
+)
+
+data class AgentInfo(
+    val id: String,
+    val name: String,
+    val description: String?,
+    val mode: String?,
+    val hidden: Boolean,
+)
+
+data class ModelInfo(
+    val modelID: String,
+    val providerID: String,
+    val name: String?,
+    val variants: List<String>,
+    val contextLimit: Long? = null,
+    val inputTypes: List<String> = emptyList(),
+) {
+    /** 与会话当前模型（composite id，如 "loomy/GLM-5.3-Flash"）匹配。 */
+    fun matches(providerID: String?, modelId: String?): Boolean {
+        if (providerID == null || modelId == null) return false
+        if (this.providerID != providerID) return false
+        return modelId == modelID || modelId.endsWith("/$modelID")
+    }
+}
+
+/** 会话累计 token 用量（服务器权威数据）。 */
+data class Tokens(
+    val input: Long,
+    val output: Long,
+    val reasoning: Long,
+    val cacheRead: Long,
+)
+
+/** token 数展示：< 1k 原样，1k~1M 一位小数 k，≥1M M。 */
+fun formatTokens(n: Long): String = when {
+    n >= 1_000_000 -> String.format(java.util.Locale.ROOT, "%.1fM", n / 1_000_000.0)
+    n >= 1000 -> String.format(java.util.Locale.ROOT, "%.1fk", n / 1000.0)
+    else -> n.toString()
+}
+
+data class CommandInfo(
+    val name: String,
+    val description: String?,
+)
+
+/** 会话当前 agent / model / 思考档位。 */
+data class SessionDetail(
+    val agent: String?,
+    val providerID: String?,
+    val modelID: String?,
+    val variant: String?,
+    val tokens: Tokens? = null,
+    val cost: Double? = null,
+)
+
+/** 一条 /api/event SSE 事件（信封已拆开，data 为载荷，created 为服务器时间戳 ms）。 */
+data class OpenCodeEvent(
+    val type: String,
+    val data: JsonObject,
+    val created: Long? = null,
+)
+
+private val lenientJson = Json { ignoreUnknownKeys = true }
+
+internal fun JsonObject.str(key: String): String? =
+    (this[key] as? JsonPrimitive)?.takeIf { it.isString }?.content
+
+internal fun JsonObject.num(key: String): Long? =
+    (this[key] as? JsonPrimitive)?.content?.toLongOrNull()
+
+/** 耗时格式：< 1s 显示毫秒，≥ 1s 显示秒（一位小数，10s 以上取整）。 */
+fun formatDuration(ms: Long?): String = when {
+    ms == null || ms < 0 -> ""
+    ms < 1000 -> "${ms}ms"
+    else -> {
+        val seconds = ms / 1000.0
+        if (seconds < 10) String.format(java.util.Locale.ROOT, "%.1fs", seconds)
+        else "${ms / 1000}s"
+    }
+}
+
+/** 从工具输入里提取一句话摘要。 */
+internal fun deriveToolTitle(input: JsonObject?): String? {
+    if (input == null) return null
+    for (key in listOf("command", "path", "filePath", "file", "pattern", "query", "url")) {
+        (input[key] as? JsonPrimitive)?.takeIf { it.isString }?.let { return it.content }
+    }
+    return null
+}
+
+internal fun joinContentText(content: JsonArray?): String? =
+    content?.mapNotNull { (it as? JsonObject)?.str("text") }
+        ?.joinToString("\n")
+        ?.takeIf { it.isNotBlank() }
+        ?.let { dev.opencode.client.ui.chat.AnsiStripper.strip(it) }
+
+/** 解析工具 metadata 里的文件变更（edit/write 工具带统一 diff）。 */
+internal fun parseFileChanges(metadata: JsonObject?): List<ToolFileChange> {
+    val files = metadata?.get("files") as? JsonArray ?: return emptyList()
+    return files.mapNotNull { el ->
+        val f = el as? JsonObject ?: return@mapNotNull null
+        ToolFileChange(
+            file = f.str("file") ?: return@mapNotNull null,
+            patch = f.str("patch") ?: "",
+            status = f.str("status") ?: "modified",
+            additions = (f["additions"] as? JsonPrimitive)?.content?.toIntOrNull() ?: 0,
+            deletions = (f["deletions"] as? JsonPrimitive)?.content?.toIntOrNull() ?: 0,
+        )
+    }
+}
+
+/** 去掉 user 文本里的附件说明（Web 会把 "Attached file: ..." 追加在正文末尾，显示时整段剔除）。 */
+private fun stripAttachmentNote(text: String): String {
+    val marker = "Attached file:"
+    val idx = text.indexOf(marker)
+    return if (idx < 0) text.trim() else text.substring(0, idx).trim()
+}
+
+/** 解析历史消息里的工具部件（{type:"tool", id, name, state:{...}, time:{created,ran,completed}}）。 */
+private fun parseToolPart(obj: JsonObject, index: Int, shellResults: Map<String, ShellResult> = emptyMap()): Block.Tool {
+    val state = obj["state"] as? JsonObject
+    val status = state?.str("status")
+    val inputObj = state?.get("input") as? JsonObject
+    val metadata = state?.get("metadata") as? JsonObject
+    val time = obj["time"] as? JsonObject
+    val created = time?.num("created")
+    val ran = time?.num("ran") ?: created
+    val completed = time?.num("completed")
+    val outputText = joinContentText(state?.get("content") as? JsonArray)
+    val shellID = metadata?.str("shellID")
+    val exit = (metadata?.get("exit") as? JsonPrimitive)?.content?.toIntOrNull()
+
+    // 命令转入后台：metadata 只有 shellID、没有 exit，输出为 "Command moved to the background"
+    // 这类不是"已完成"。若 synthetic 回执里有该 shell 的最终结果，则用它补全输出/退出码
+    val wasBackground = shellID != null && exit == null &&
+        outputText?.startsWith("Command moved to the background") == true
+    val shellResult = if (wasBackground && shellID != null) shellResults[shellID] else null
+    val background = wasBackground && shellResult == null
+    val finalExit = exit ?: shellResult?.exit
+    val finalOutput = shellResult?.output?.takeIf { it.isNotBlank() } ?: outputText
+    val finalTruncated = shellResult?.truncated ?: ((metadata?.get("truncated") as? JsonPrimitive)?.content == "true")
+
+    val call = ToolCall(
+        id = obj.str("id") ?: "tool-$index",
+        name = obj.str("name") ?: "tool",
+        state = when {
+            background -> "running"
+            shellResult != null -> if (finalExit == null || finalExit == 0) "success" else "failed"
+            status == "completed" -> "success"
+            status == "error" || status == "failed" -> "failed"
+            else -> "running"
+        },
+        title = deriveToolTitle(inputObj) ?: if (background) "已转入后台" else null,
+        input = inputObj?.toString(),
+        output = finalOutput,
+        exit = finalExit,
+        durationMs = when {
+            background -> null
+            // 后台命令完成后：用开始执行到回执完成的时长
+            shellResult != null && shellResult.completedAt != null && ran != null ->
+                (shellResult.completedAt - ran).takeIf { it >= 0 }
+            completed != null && ran != null -> (completed - ran).takeIf { it >= 0 }
+            else -> null
+        },
+        truncated = finalTruncated,
+        fileChanges = parseFileChanges(metadata),
+        timestampMs = created,
+        background = background,
+        shellID = shellID,
+    )
+    return Block.Tool(call)
+}
+
+/**
+ * 解析 GET /api/session/{id}/message 响应。
+ * user 消息文本在顶层 text 字段（payload.text 是 prompt 响应形状，作兜底），
+ * assistant 在 content[]；content[] 数组顺序即渲染顺序。
+ * synthetic / idle 等类型无文本块，解析后自然被过滤。
+ */
+fun parseMessages(body: String): List<ChatMessage> {
+    val root = lenientJson.parseToJsonElement(body)
+    val array: JsonArray = when {
+        root is JsonArray -> root
+        root is JsonObject && root["data"] is JsonArray -> root["data"] as JsonArray
+        else -> return emptyList()
+    }
+    // 先收集 shell 回执（synthetic）的最终状态：后台命令跑完后，结果只在这里
+    val shellResults = HashMap<String, ShellResult>()
+    array.forEach { element ->
+        val obj = element as? JsonObject ?: return@forEach
+        if (obj.str("type") != "synthetic") return@forEach
+        val meta = obj["metadata"] as? JsonObject ?: return@forEach
+        if (meta.str("source") != "shell") return@forEach
+        val shellID = meta.str("shellID") ?: return@forEach
+        val raw = obj.str("text") ?: return@forEach
+        val output = Regex(">([\\s\\S]*)</shell>").find(raw)?.groupValues?.get(1)?.trim().orEmpty()
+        shellResults[shellID] = ShellResult(
+            output = AnsiStripper.strip(output),
+            exit = (meta["exit"] as? JsonPrimitive)?.content?.toIntOrNull(),
+            state = meta.str("state") ?: "completed",
+            truncated = (meta["truncated"] as? JsonPrimitive)?.content == "true",
+            completedAt = (obj["time"] as? JsonObject)?.num("created"),
+        )
+    }
+
+    return array.mapNotNull { element ->
+        val obj = element as? JsonObject ?: return@mapNotNull null
+        val id = obj.str("id") ?: return@mapNotNull null
+        val type = obj.str("type") ?: "assistant"
+
+        val blocks = mutableListOf<Block>()
+
+        if (type == "user") {
+            val text = obj.str("text")
+                ?: ((obj["payload"] as? JsonObject)?.get("text") as? JsonPrimitive)
+                    ?.takeIf { it.isString }?.content
+            if (text != null && !text.startsWith("<shell ")) {
+                // 图片附件在 displayText 里是纯文本路径，正文只留用户真正打的字
+                blocks += Block.Text("text", stripAttachmentNote(text), 0)
+            }
+        }
+
+        (obj["content"] as? JsonArray)?.forEachIndexed { index, partEl ->
+            val partObj = partEl as? JsonObject ?: return@forEachIndexed
+            when (val partType = partObj.str("type")) {
+                "text", "reasoning" -> {
+                    val text = partObj.str("text") ?: return@forEachIndexed
+                    // 服务器常见：思考部件只有空白内容（text=" "），不渲染空折叠框
+                    if (partType == "reasoning" && text.isBlank()) return@forEachIndexed
+                    // 思考过程耗时：历史里在 part.time{created,completed}
+                    val durationMs = if (partType == "reasoning") {
+                        val time = partObj["time"] as? JsonObject
+                        val created = time?.num("created")
+                        val completed = time?.num("completed")
+                        if (created != null && completed != null) {
+                            (completed - created).takeIf { it >= 0 }
+                        } else null
+                    } else null
+                    blocks += Block.Text(partType, text, index, durationMs)
+                }
+                "tool" -> blocks += parseToolPart(partObj, index, shellResults)
+            }
+        }
+
+        // shell 回执（synthetic）：<shell id state command>输出</shell>
+        if (type == "synthetic") {
+            val raw = obj.str("text") ?: return@mapNotNull null
+            val meta = obj["metadata"] as? JsonObject
+            if (meta?.str("source") == "shell") {
+                val command = Regex("<shell[^>]*command=\"(.*?)\"[^>]*>", RegexOption.DOT_MATCHES_ALL)
+                    .find(raw)?.groupValues?.get(1)?.replace("&quot;", "\"").orEmpty()
+                val output = Regex(">([\\s\\S]*)</shell>").find(raw)?.groupValues?.get(1)?.trim().orEmpty()
+                val state = meta.str("state") ?: "completed"
+                val exit = (meta["exit"] as? JsonPrimitive)?.content?.toIntOrNull()
+                // synthetic 回执没有独立时间字段，用消息 created 与 metadata 完成时间兜底
+                val created = (obj["time"] as? JsonObject)?.num("created")
+                blocks += Block.Tool(
+                    ToolCall(
+                        id = id,
+                        name = "shell",
+                        state = if (state == "completed" && (exit == null || exit == 0)) "success" else "failed",
+                        title = command.lineSequence().firstOrNull()?.take(80),
+                        input = command,
+                        output = AnsiStripper.strip(output).ifBlank { "(无输出)" },
+                        exit = exit,
+                        truncated = (meta["truncated"] as? JsonPrimitive)?.content == "true",
+                        durationMs = null, // shell 回执无耗时数据，不显示比显示错误值好
+                        timestampMs = created,
+                    )
+                )
+            }
+        }
+
+        val images = (obj["files"] as? JsonArray)?.mapNotNull { el ->
+            val f = el as? JsonObject ?: return@mapNotNull null
+            val data = f.str("data") ?: return@mapNotNull null
+            val mime = f.str("mime") ?: return@mapNotNull null
+            if (!mime.startsWith("image/") || data.isEmpty()) return@mapNotNull null
+            MessageImage(base64 = data, mime = mime, name = f.str("name"))
+        }.orEmpty()
+
+        // Web 用 metadata.attachments 渲染附件芯片（路径引用，非内联字节）
+        val attachments = ((obj["metadata"] as? JsonObject)?.get("attachments") as? JsonArray)
+            ?.mapNotNull { el ->
+                val a = el as? JsonObject ?: return@mapNotNull null
+                val path = a.str("path") ?: return@mapNotNull null
+                MessageAttachment(
+                    name = a.str("name") ?: path.substringAfterLast('/'),
+                    mime = a.str("mime") ?: "application/octet-stream",
+                    path = path,
+                )
+            }.orEmpty()
+
+        if (blocks.isEmpty() && images.isEmpty() && attachments.isEmpty()) return@mapNotNull null
+
+        // 官方 contextUsage 分子（TUI session.ts）: input+output+reasoning+cache.read+cache.write
+        val tokensObj = obj["tokens"] as? JsonObject
+        val totalTokens = tokensObj?.let {
+            (it.num("input") ?: 0) + (it.num("output") ?: 0) + (it.num("reasoning") ?: 0) +
+                ((it["cache"] as? JsonObject)?.num("read") ?: 0) +
+                ((it["cache"] as? JsonObject)?.num("write") ?: 0)
+        }?.takeIf { it > 0 }
+        ChatMessage(
+            id = id,
+            role = type,
+            blocks = blocks,
+            totalTokens = totalTokens,
+            images = images,
+            attachments = attachments,
+        )
+    }
+}
+
+/** 解析 POST /api/session 响应里的新会话 ID。 */
+fun parseSessionId(body: String): String? {
+    val root = lenientJson.parseToJsonElement(body)
+    val data = root as? JsonObject ?: return null
+    return (data["data"] as? JsonObject)?.str("id") ?: data.str("id")
+}
+
+/** 解析 GET /api/session/{id}（会话详情，取当前 agent/model/variant）。 */
+fun parseSessionDetail(body: String): SessionDetail? {
+    val root = lenientJson.parseToJsonElement(body)
+    val data = ((root as? JsonObject)?.get("data") as? JsonObject) ?: (root as? JsonObject) ?: return null
+    val model = data["model"] as? JsonObject
+    val tokensObj = data["tokens"] as? JsonObject
+    val tokens = tokensObj?.let {
+        Tokens(
+            input = it.num("input") ?: 0,
+            output = it.num("output") ?: 0,
+            reasoning = it.num("reasoning") ?: 0,
+            cacheRead = (it["cache"] as? JsonObject)?.num("read") ?: 0,
+        )
+    }
+    return SessionDetail(
+        agent = data.str("agent"),
+        providerID = model?.str("providerID"),
+        modelID = model?.str("id"),
+        variant = model?.str("variant"),
+        tokens = tokens,
+        cost = (data["cost"] as? JsonPrimitive)?.content?.toDoubleOrNull(),
+    )
+}
+
+private inline fun <reified T> parseDataArray(body: String, map: (JsonObject) -> T?): List<T> {
+    val root = lenientJson.parseToJsonElement(body)
+    val array: JsonArray = when {
+        root is JsonArray -> root
+        root is JsonObject && root["data"] is JsonArray -> root["data"] as JsonArray
+        else -> return emptyList()
+    }
+    return array.mapNotNull { (it as? JsonObject)?.let(map) }
+}
+
+fun parseAgents(body: String): List<AgentInfo> = parseDataArray(body) { obj ->
+    AgentInfo(
+        id = obj.str("id") ?: return@parseDataArray null,
+        name = obj.str("name") ?: obj.str("id") ?: "",
+        description = obj.str("description"),
+        mode = obj.str("mode"),
+        hidden = (obj["hidden"] as? JsonPrimitive)?.content == "true",
+    )
+}
+
+fun parseModels(body: String): List<ModelInfo> = parseDataArray(body) { obj ->
+    val modelId = obj.str("modelID") ?: obj.str("id") ?: return@parseDataArray null
+    val providerId = obj.str("providerID") ?: return@parseDataArray null
+    ModelInfo(
+        modelID = modelId,
+        providerID = providerId,
+        name = obj.str("name"),
+        variants = (obj["variants"] as? JsonArray)
+            ?.mapNotNull { v -> (v as? JsonObject)?.str("id") }
+            .orEmpty(),
+        contextLimit = ((obj["limit"] as? JsonObject)?.get("context") as? JsonPrimitive)
+            ?.content?.toLongOrNull(),
+        inputTypes = ((obj["capabilities"] as? JsonObject)?.get("input") as? JsonArray)
+            ?.mapNotNull { v -> (v as? JsonPrimitive)?.takeIf { it.isString }?.content }
+            .orEmpty(),
+    )
+}
+
+fun parseCommands(body: String): List<CommandInfo> = parseDataArray(body) { obj ->
+    CommandInfo(
+        name = obj.str("name") ?: return@parseDataArray null,
+        description = obj.str("description"),
+    )
+}

@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  OpenCode 客户端主要连接本机 / 局域网内的 opencode serve（如 Termux 里的 127.0.0.1:4096），
+  这类地址通常没有 TLS 证书，因此允许明文 HTTP。
+  若服务器配置了 HTTPS，App 仍优先使用 https:// 地址。
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true" />
+</network-security-config>
