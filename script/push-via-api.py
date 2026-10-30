@@ -50,6 +50,9 @@ def api_request(token: str, method: str, path: str, payload=None, retries: int =
             body = e.read().decode()
             if e.code == 404:
                 return e.code, None
+            if e.code in (422, 409):
+                # 已存在 / 冲突（tag ref 重复）：交给调用方决定是否强制更新
+                return e.code, None
             raise SystemExit(f"API {method} {path} -> {e.code}\n{body}")
         except (urllib.error.URLError, ConnectionError, TimeoutError, OSError) as e:
             last_err = e
@@ -189,6 +192,24 @@ def main() -> None:
                     {"sha": parent, "force": False})
 
     print(f"pushed {len(pending)} commit(s) -> https://github.com/{repo} ({branch})")
+
+    # 同步本地 tag（发布用）：为每个指向 HEAD 的 tag 建立/更新远端 ref
+    tags = run("git", "tag", "--points-at", "HEAD").splitlines()
+    for tag in tags:
+        if not tag:
+            continue
+        # 远端 tag 指向的提交需是远端存在的 SHA（用映射换算）
+        remote_sha = parent
+        status, _ = api_request(token, "POST", f"/repos/{repo}/git/refs",
+                                {"ref": f"refs/tags/{tag}", "sha": remote_sha})
+        if status in (200, 201):
+            print(f"tag {tag} -> {remote_sha[:12]}")
+        else:
+            # 已存在则强制更新
+            api_request(token, "PATCH", f"/repos/{repo}/git/refs/tags/{tag}",
+                        {"sha": remote_sha, "force": True})
+            print(f"tag {tag} -> {remote_sha[:12]} (updated)")
+
     if notice:
         print("注意：远端提交因时区标准化与本地 SHA 不同（内容一致）。"
               "网络恢复后执行 `git push --force` 可让远端重新对齐本地历史。")

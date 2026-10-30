@@ -25,10 +25,9 @@ jobs:
         env:
           SIGNING_KEYSTORE: ${{ secrets.SIGNING_KEYSTORE }}
         run: |
-          mkdir -p "$RUNNER_TEMP"
-          printf '%s' "$SIGNING_KEYSTORE" > "$RUNNER_TEMP/keystore.b64"
-          base64 -d "$RUNNER_TEMP/keystore.b64" > "$RUNNER_TEMP/release.keystore"
-          echo "SIGNING_TMP_DIR=$RUNNER_TEMP" >> "$GITHUB_ENV"
+          printf '%s' "$SIGNING_KEYSTORE" | base64 -d > "$RUNNER_TEMP/release.keystore"
+          echo "keystore bytes: $(wc -c < "$RUNNER_TEMP/release.keystore")"
+          echo "SIGNING_STORE_FILE=$RUNNER_TEMP/release.keystore" >> "$GITHUB_ENV"
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
@@ -39,6 +38,26 @@ jobs:
           SIGNING_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
           SIGNING_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
         run: ./gradlew :app:assembleRelease --stacktrace
+
+      - name: Verify signing certificate
+        run: |
+          APK=$(ls app/build/outputs/apk/release/*.apk | head -1)
+          KS="$RUNNER_TEMP/release.keystore"
+          echo "== 期望证书 =="
+          keytool -list -v -keystore "$KS" -storepass "${{ secrets.SIGNING_STORE_PASSWORD }}" \
+            -alias "${{ secrets.SIGNING_KEY_ALIAS }}" 2>/dev/null | grep "SHA256:" | head -1
+          echo "== APK 实际证书 =="
+          $ANDROID_HOME/build-tools/*/apksigner verify --print-certs "$APK" 2>/dev/null | grep "SHA-256" | head -1
+          # 证书不一致直接失败，避免再发出装不上的包
+          EXPECTED=$(keytool -list -v -keystore "$KS" -storepass "${{ secrets.SIGNING_STORE_PASSWORD }}" \
+            -alias "${{ secrets.SIGNING_KEY_ALIAS }}" 2>/dev/null | grep "SHA256:" | head -1 | awk '{print $2}')
+          ACTUAL=$($ANDROID_HOME/build-tools/*/apksigner verify --print-certs "$APK" 2>/dev/null | grep "SHA-256" | head -1 | awk '{print $2}')
+          if [ "$EXPECTED" = "$ACTUAL" ] && [ -n "$EXPECTED" ]; then
+            echo "✅ 签名与 keystore 一致"
+          else
+            echo "❌ 签名不一致（expected=$EXPECTED actual=$ACTUAL）"
+            exit 1
+          fi
 
       - name: Report APK size
         run: |

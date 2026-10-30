@@ -1,4 +1,3 @@
-import java.util.Base64
 
 plugins {
     alias(libs.plugins.android.application)
@@ -33,19 +32,20 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
-            // 固定签名：从环境变量读取（CI 用 GitHub Secrets 注入）。
-            // 签名不变才能覆盖安装升级；本地无环境变量时回退 debug 签名便于调试
-            val ksB64 = System.getenv("SIGNING_KEYSTORE")
-            if (ksB64 != null) {
-                val ksFile = File("${System.getenv("SIGNING_TMP_DIR") ?: "."}/release.keystore")
-                ksFile.parentFile?.mkdirs()
-                ksFile.writeBytes(Base64.getDecoder().decode(ksB64))
+            // 固定签名：CI 通过 SIGNING_STORE_FILE 传入 keystore 文件路径
+            // （workflow 里从 secret 解码到 $RUNNER_TEMP/release.keystore）。
+            // 签名不变才能覆盖安装升级；未配置时回退 debug 签名便于本地调试。
+            val ksPath = System.getenv("SIGNING_STORE_FILE")
+            if (ksPath != null && File(ksPath).exists()) {
                 signingConfigs {
                     create("release") {
-                        storeFile = ksFile
+                        storeFile = File(ksPath)
                         storePassword = System.getenv("SIGNING_STORE_PASSWORD")
                         keyAlias = System.getenv("SIGNING_KEY_ALIAS")
                         keyPassword = System.getenv("SIGNING_KEY_PASSWORD")
+                        // 同时启用 V1+V2，兼容旧系统安装
+                        enableV1Signing = true
+                        enableV2Signing = true
                     }
                 }
                 signingConfig = signingConfigs.getByName("release")
