@@ -1,0 +1,61 @@
+name: Build Release APK
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build release APK (R8)
+        run: ./gradlew :app:assembleRelease --stacktrace
+
+      - name: Report APK size
+        run: |
+          f=$(ls app/build/outputs/apk/release/*.apk | head -1)
+          echo "### Release APK（预发行）" >> $GITHUB_STEP_SUMMARY
+          echo "| 文件 | 大小 |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| $(basename "$f") | $(du -h "$f" | cut -f1) |" >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload release APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: opencode-client-release
+          path: app/build/outputs/apk/release/*.apk
+          retention-days: 14
+
+      # 打 v* tag 时自动发布为 GitHub Pre-release（预发行）
+      - name: Publish pre-release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          prerelease: true
+          generate_release_notes: true
+          files: app/build/outputs/apk/release/*.apk
+          body: |
+            > 预发行版本（pre-release），仅供测试，可能存在缺陷。
+
+            非官方 OpenCode 安卓客户端。安装前请确认服务器可用：
+
+            ```
+            OPENCODE_PASSWORD=你的密码 opencode serve --port 4096
+            ```
