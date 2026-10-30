@@ -12,8 +12,8 @@ android {
         applicationId = "dev.opencode.client"
         minSdk = 26
         targetSdk = 36
-        versionCode = 7
-        versionName = "0.3.4-pre"
+        versionCode = 8
+        versionName = "0.3.5-pre"
         ndk {
             // 只出 64 位包
             abiFilters.add("arm64-v8a")
@@ -31,8 +31,25 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
-            // 用 debug 签名，便于直接安装测试（正式发布请替换为自己的 keystore）
-            signingConfig = signingConfigs.getByName("debug")
+            // 固定签名：从环境变量读取（CI 用 GitHub Secrets 注入）。
+            // 签名不变才能覆盖安装升级；本地无环境变量时回退 debug 签名便于调试
+            val ksB64 = System.getenv("SIGNING_KEYSTORE")
+            if (ksB64 != null) {
+                val ksFile = File("${System.getenv("SIGNING_TMP_DIR") ?: "."}/release.keystore")
+                ksFile.parentFile?.mkdirs()
+                ksFile.writeBytes(java.util.Base64.getDecoder().decode(ksB64))
+                signingConfigs {
+                    create("release") {
+                        storeFile = ksFile
+                        storePassword = System.getenv("SIGNING_STORE_PASSWORD")
+                        keyAlias = System.getenv("SIGNING_KEY_ALIAS")
+                        keyPassword = System.getenv("SIGNING_KEY_PASSWORD")
+                    }
+                }
+                signingConfig = signingConfigs.getByName("release")
+            } else {
+                signingConfig = signingConfigs.getByName("debug")
+            }
         }
     }
     compileOptions {

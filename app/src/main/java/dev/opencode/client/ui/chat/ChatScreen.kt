@@ -184,10 +184,13 @@ fun ChatScreen(mainVm: MainViewModel) {
         // 吸底时跟随新消息
         if (autoScroll.value) listState.scrollToItem(state.messages.lastIndex)
     }
-    // 离开会话时保存当前视口锚点（消息 id + 偏移）
+    // 离开会话时保存视口锚点：仅在上翻阅读时保存（吸底时无需记忆，
+    // 恢复时直接回到底部——否则从底部切走再回来会落在视口顶部而非底部）
     DisposableEffect(sessionId) {
         onDispose {
-            anchorId?.let { mainVm.saveScrollPosition(sessionId, "$it:$anchorOffset") }
+            if (!autoScroll.value && anchorId != null) {
+                mainVm.saveScrollPosition(sessionId, "$anchorId:$anchorOffset")
+            }
         }
     }
     LaunchedEffect(state.streaming, forceScrollTrigger) {
