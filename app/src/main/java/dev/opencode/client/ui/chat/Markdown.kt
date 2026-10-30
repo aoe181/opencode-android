@@ -47,11 +47,18 @@ fun MarkdownText(
         },
         update = { tv ->
             tv.setTextColor(color.toArgb())
-            val renderer = if (usePlain) markwonNoTables else markwon
-            renderer.setMarkdown(tv, markdown)
-            // 语法染色是纯 CPU 遍历，流式时文本增长很快；长文本降频以免抢主线程帧时间
-            if (markdown.length <= HIGHLIGHT_SYNC_LIMIT || markdown.endsWith("```")) {
-                Highlighter.apply(tv)
+            // 关键优化：内容没变就不重渲染。
+            // 流式期间整条消息每帧都会重建，若不加此判断，同一消息里已完成的
+            // 块（尤其是表格）也会被反复 setMarkdown + 整段重排，造成闪烁。
+            val key = "$usePlain\u0000${markdown.length}\u0000${markdown.hashCode()}"
+            if (tv.tag != key) {
+                tv.tag = key
+                val renderer = if (usePlain) markwonNoTables else markwon
+                renderer.setMarkdown(tv, markdown)
+                // 语法染色是纯 CPU 遍历，流式时文本增长很快；长文本降频以免抢主线程帧时间
+                if (markdown.length <= HIGHLIGHT_SYNC_LIMIT || markdown.endsWith("```")) {
+                    Highlighter.apply(tv)
+                }
             }
         }
     )

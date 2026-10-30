@@ -248,6 +248,50 @@ class OpenCodeApi {
     suspend fun mcpServers(server: RemoteServer): Result<List<McpServerInfo>> =
         get(server, "/api/mcp").mapCatching(::parseMcpServers)
 
+    /** 拉取会话当前待投递的输入。
+     *
+     * 用于启动/刷新时同步"排队中/将插入"的输入，让长按撤回在重启后依然可用
+     * （仅靠 inbox.enqueued 事件，重启后会丢状态）。
+     * 对应 GET /api/session/{id}/inbox，返回 Inbox.Item 数组。
+     */
+    suspend fun inboxList(server: RemoteServer, sessionID: String): Result<List<PendingInboxItem>> =
+        get(server, "/api/session/$sessionID/inbox").mapCatching(::parseInboxItems)
+
+    /** 当前正在执行任务的会话：sessionId -> 状态类型（running 等）。用于切换会话后恢复停止按钮。 */
+    suspend fun activeSessions(server: RemoteServer): Result<Map<String, String>> =
+        get(server, "/api/session/active").mapCatching { body ->
+            val root = json.parseToJsonElement(body)
+            val obj = ((root as? JsonObject)?.get("data") as? JsonObject) ?: JsonObject(emptyMap())
+            obj.mapValues { (_, v) -> (v as? JsonObject)?.str("type") ?: "unknown" }
+        }
+
+    /** 暂存回退点（Web 的"回退到这里"）。files=true 时同时还原文件改动。 */
+    suspend fun revertStage(
+        server: RemoteServer,
+        sessionID: String,
+        messageID: String,
+        files: Boolean,
+    ): Result<Unit> = post(
+        server,
+        "/api/session/$sessionID/revert/stage",
+        """{"messageID":"$messageID","files":$files}""",
+    ).map { }
+
+    /** 提交已暂存的回退（真正删除该消息之后的内容）。 */
+    suspend fun revertCommit(server: RemoteServer, sessionID: String): Result<Unit> =
+        post(server, "/api/session/$sessionID/revert/commit", "{}").map { }
+
+    /** 清除已暂存的回退（失败恢复用）。 */
+    suspend fun revertClear(server: RemoteServer, sessionID: String): Result<Unit> =
+        withContext(Dispatchers.IO) {
+            runCatching {
+                client.newCall(request(server, "/api/session/$sessionID/revert").delete().build())
+                    .execute().use { resp ->
+                        if (!resp.isSuccessful) error("HTTP ${resp.code}")
+                    }
+            }
+        }
+
     /**
      * 运行时重连一个 MCP 服务器。
      *

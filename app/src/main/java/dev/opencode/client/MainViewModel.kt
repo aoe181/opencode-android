@@ -52,8 +52,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     private val _drafts = MutableStateFlow<Map<String, String>>(emptyMap())
     val drafts: StateFlow<Map<String, String>> = _drafts.asStateFlow()
 
-    /** 各会话上次浏览到的消息索引（持久化）。 */
-    private val _scrollPositions = mutableMapOf<String, Int>()
+    /** 各会话上次浏览位置（"消息id:偏移"，按 id 锚定，历史分页后索引会漂移）。 */
+    private val _scrollPositions = mutableMapOf<String, String>()
 
     /** 会话本地状态（草稿+滚动）批量落盘防抖。 */
     private var persistJob: Job? = null
@@ -76,12 +76,12 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         persistSessionLocal()
     }
 
-    fun saveScrollPosition(sessionID: String, index: Int) {
-        _scrollPositions[sessionID] = index
+    fun saveScrollPosition(sessionID: String, anchor: String) {
+        _scrollPositions[sessionID] = anchor
         persistSessionLocal()
     }
 
-    fun scrollPosition(sessionID: String): Int? = _scrollPositions[sessionID]
+    fun scrollPosition(sessionID: String): String? = _scrollPositions[sessionID]
 
     fun openSession(id: String, title: String) {
         _selected.value = id to title

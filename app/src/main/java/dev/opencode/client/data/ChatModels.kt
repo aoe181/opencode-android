@@ -631,6 +631,26 @@ fun parseSkills(body: String): List<SkillInfo> = parseDataArray(body) { obj ->
     )
 }
 
+/** 待投递输入（inbox 里尚未送达的用户消息）。 */
+data class PendingInboxItem(
+    val id: String,
+    val text: String,
+    val delivery: String,
+)
+
+fun parseInboxItems(body: String): List<PendingInboxItem> = parseDataArray(body) { obj ->
+    // 只关心用户输入项；synthetic/compaction/move 等系统项忽略
+    if (obj.str("type") != "user") return@parseDataArray null
+    val id = obj.str("id") ?: return@parseDataArray null
+    val text = ((obj["payload"] as? JsonObject)?.get("text") as? JsonPrimitive)?.content
+        ?: return@parseDataArray null
+    PendingInboxItem(
+        id = id,
+        text = text,
+        delivery = obj.str("delivery") ?: "steer",
+    )
+}
+
 fun parseCommands(body: String): List<CommandInfo> = parseDataArray(body) { obj ->
     CommandInfo(
         name = obj.str("name") ?: return@parseDataArray null,

@@ -131,29 +131,64 @@ fun ChatScreen(mainVm: MainViewModel) {
             last >= info.totalItemsCount - 2
         }.collect { atBottom -> autoScroll.value = atBottom }
     }
-    // 流式/新增消息时平滑跟随；用 animateScrollToItem 避免瞬间跳动造成的"闪一下"
+    // 视口锚点：记录首条可见消息的 id 与偏移。
+    // 历史分页会在顶部插入更旧的消息，所有索引随之漂移；若按索引定位，
+    // 视口内容会瞬间变成"上面"的消息——这就是进入会话/发送时屏幕向上跳的原因。
+    var anchorId by remember(sessionId) { mutableStateOf<String?>(null) }
+    var anchorOffset by remember(sessionId) { mutableStateOf(0) }
+    LaunchedEffect(listState) {
+        snapshotFlow {
+            val info = listState.layoutInfo.visibleItemsInfo.firstOrNull()
+            info?.key to (info?.offset ?: 0)
+        }.collect { (id, offset) ->
+            if (restoredOnce && id != null) {
+                anchorId = id
+                anchorOffset = offset
+            }
+        }
+    }
     // 首次进入会话：优先恢复上次位置；没有记录则回到底部
     var restoredOnce by remember(sessionId) { mutableStateOf(false) }
     LaunchedEffect(state.messages.size) {
-        if (restoredOnce || state.messages.isEmpty()) return@LaunchedEffect
-        restoredOnce = true
-        val saved = mainVm.scrollPosition(sessionId)
-        if (saved != null && saved in 0 until state.messages.size) {
-            listState.scrollToItem(saved)
-        } else {
-            listState.scrollToItem(state.messages.lastIndex)
+        if (state.messages.isEmpty()) return@LaunchedEffect
+        if (!restoredOnce) {
+            restoredOnce = true
+            val anchor = mainVm.scrollPosition(sessionId)
+            val restoredIndex = anchor?.let { a ->
+                val id = a.substringBefore(':')
+                val off = a.substringAfter(':', "0").toIntOrNull() ?: 0
+                val idx = state.messages.indexOfFirst { it.id == id }
+                if (idx >= 0) {
+                    listState.scrollToItem(idx.coerceAtMost(state.messages.lastIndex), off)
+                    idx
+                } else null
+            }
+            if (restoredIndex != null) {
+                // 恢复到非底部位置时立即关掉吸底，否则后台分页完成后会被拉到底部
+                autoScroll.value = restoredIndex >= state.messages.lastIndex - 1
+            } else {
+                listState.scrollToItem(state.messages.lastIndex)
+            }
+            return@LaunchedEffect
         }
+        // 历史分页在顶部插入旧消息后按 id 重新锚定，避免索引漂移造成内容上跳
+        val id = anchorId
+        if (id != null) {
+            val idx = state.messages.indexOfFirst { it.id == id }
+            if (idx >= 0 && idx != listState.firstVisibleItemIndex) {
+                listState.scrollToItem(idx, anchorOffset)
+            }
+        }
+        // 吸底时跟随新消息
+        if (autoScroll.value) listState.scrollToItem(state.messages.lastIndex)
     }
-    // 离开会话时保存当前可见的第一条索引
+    // 离开会话时保存当前视口锚点（消息 id + 偏移）
     DisposableEffect(sessionId) {
         onDispose {
-            mainVm.saveScrollPosition(
-                sessionId,
-                listState.firstVisibleItemIndex
-            )
+            anchorId?.let { mainVm.saveScrollPosition(sessionId, "$it:$anchorOffset") }
         }
     }
-    LaunchedEffect(state.messages.size, state.streaming, forceScrollTrigger) {
+    LaunchedEffect(state.streaming, forceScrollTrigger) {
         if (state.messages.isEmpty() || !restoredOnce) return@LaunchedEffect
         if (state.streaming || autoScroll.value || forceScrollTrigger > 0) {
             listState.animateScrollToItem(state.messages.lastIndex)
@@ -278,6 +313,7 @@ fun ChatScreen(mainVm: MainViewModel) {
                         onLongPress = { actionMessage = message },
                         // 只有正在流式增长的最后一条 assistant 消息才降级表格渲染
                         streaming = state.streaming && message.id == state.messages.lastOrNull()?.id,
+                        pendingDelivery = state.pendingDeliveries[message.id],
                     )
                 }
                 if (state.streaming && state.messages.lastOrNull()?.role != "assistant") {
@@ -292,27 +328,74 @@ fun ChatScreen(mainVm: MainViewModel) {
                 }
             }
 
-            androidx.compose.animation.AnimatedVisibility(
-                visible = !autoScroll.value && state.messages.isNotEmpty(),
-                enter = androidx.compose.animation.fadeIn() + androidx.compose.animation.scaleIn(),
-                exit = androidx.compose.animation.fadeOut() + androidx.compose.animation.scaleOut(),
-                modifier = Modifier.align(Alignment.BottomEnd)
+            // 右下角悬浮按钮组：上"回到底部"、下"停止"（停止在发送按钮正上方，二者留 8dp 间距）
+            Column(
+                modifier = Modifier
+                    .align(Alignment.BottomEnd)
+                    .padding(end = 12.dp, bottom = 12.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+                horizontalAlignment = Alignment.End
             ) {
-                Surface(
-                    onClick = {
-                        autoScroll.value = true
-                        scope.launch {
-                            if (state.messages.isNotEmpty()) listState.scrollToItem(state.messages.lastIndex)
-                        }
-                    },
-                    shape = CircleShape,
-                    color = MaterialTheme.colorScheme.primaryContainer,
-                    modifier = Modifier
-                        .padding(end = 12.dp, bottom = 12.dp)
-                        .size(34.dp)
+                androidx.compose.animation.AnimatedVisibility(
+                    visible = !autoScroll.value && state.messages.isNotEmpty(),
+                    enter = androidx.compose.animation.fadeIn() + androidx.compose.animation.scaleIn(),
+                    exit = androidx.compose.animation.fadeOut() + androidx.compose.animation.scaleOut()
                 ) {
-                    Box(contentAlignment = Alignment.Center, modifier = Modifier.fillMaxSize()) {
-                        Text("↓", style = MaterialTheme.typography.titleMedium)
+                    Surface(
+                        onClick = {
+                            autoScroll.value = true
+                            scope.launch {
+                                if (state.messages.isNotEmpty()) listState.scrollToItem(state.messages.lastIndex)
+                            }
+                        },
+                        shape = CircleShape,
+                        color = MaterialTheme.colorScheme.primaryContainer,
+                        modifier = Modifier.size(34.dp)
+                    ) {
+                        Box(contentAlignment = Alignment.Center, modifier = Modifier.fillMaxSize()) {
+                            Text("↓", style = MaterialTheme.typography.titleMedium)
+                        }
+                    }
+                }
+
+                // 停止悬浮按钮：会话执行中随时可中断，切换会话后依然可用
+                androidx.compose.animation.AnimatedVisibility(
+                    visible = state.streaming,
+                    enter = androidx.compose.animation.fadeIn() + androidx.compose.animation.scaleIn(),
+                    exit = androidx.compose.animation.fadeOut() + androidx.compose.animation.scaleOut()
+                ) {
+                    var stopping by remember { mutableStateOf(false) }
+                    LaunchedEffect(state.streaming) { if (!state.streaming) stopping = false }
+                    Surface(
+                        onClick = {
+                            if (!stopping) {
+                                stopping = true
+                                chatVm.interrupt()
+                            }
+                        },
+                        shape = CircleShape,
+                        color = if (stopping) MaterialTheme.colorScheme.onSurfaceVariant
+                                else MaterialTheme.colorScheme.error,
+                        modifier = Modifier.size(34.dp)
+                    ) {
+                        Box(contentAlignment = Alignment.Center, modifier = Modifier.fillMaxSize()) {
+                            if (stopping) {
+                                CircularProgressIndicator(
+                                    modifier = Modifier.size(14.dp),
+                                    strokeWidth = 2.dp,
+                                    color = MaterialTheme.colorScheme.surface
+                                )
+                            } else {
+                                Box(
+                                    modifier = Modifier
+                                        .size(10.dp)
+                                        .background(
+                                            MaterialTheme.colorScheme.onError,
+                                            RoundedCornerShape(3.dp)
+                                        )
+                                )
+                            }
+                        }
                     }
                 }
             }
@@ -405,7 +488,7 @@ fun ChatScreen(mainVm: MainViewModel) {
                 }
             }
 
-            // 输入行：紧凑输入框 + 附件 + 发送（发送键正上方是停止小圆点）
+            // 输入行：紧凑输入框 + 附件 + 发送（停止已改为悬浮按钮）
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -450,59 +533,18 @@ fun ChatScreen(mainVm: MainViewModel) {
                     )
                 }
                 Spacer(Modifier.width(8.dp))
-                Column(
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                FilledIconButton(
+                    onClick = {
+                        chatVm.send(input)
+                        input = ""
+                        mainVm.saveDraft(sessionId, "")
+                        // 自己发消息：强制回到底部
+                        autoScroll.value = true
+                        forceScrollTrigger++
+                    },
+                    enabled = !state.sending && input.isNotBlank()
                 ) {
-                    if (state.streaming) {
-                        // 停止小圆点：仅一个 22dp 红点，无底板；点击后变灰+转圈表示正在中断
-                        var stopping by remember(state.streaming) { mutableStateOf(false) }
-                        LaunchedEffect(state.streaming) { if (!state.streaming) stopping = false }
-                        Box(
-                            modifier = Modifier
-                                .size(22.dp)
-                                .background(
-                                    if (stopping) MaterialTheme.colorScheme.onSurfaceVariant
-                                    else MaterialTheme.colorScheme.error,
-                                    CircleShape
-                                )
-                                .clickable(enabled = !stopping) {
-                                    stopping = true
-                                    chatVm.interrupt()
-                                },
-                            contentAlignment = Alignment.Center
-                        ) {
-                            if (stopping) {
-                                CircularProgressIndicator(
-                                    modifier = Modifier.size(12.dp),
-                                    strokeWidth = 2.dp,
-                                    color = MaterialTheme.colorScheme.surface
-                                )
-                            } else {
-                                Box(
-                                    modifier = Modifier
-                                        .size(8.dp)
-                                        .background(
-                                            MaterialTheme.colorScheme.onError,
-                                            RoundedCornerShape(2.dp)
-                                        )
-                                )
-                            }
-                        }
-                    }
-                    FilledIconButton(
-                        onClick = {
-                            chatVm.send(input)
-                            input = ""
-                            mainVm.saveDraft(sessionId, "")
-                            // 自己发消息：强制回到底部
-                            autoScroll.value = true
-                            forceScrollTrigger++
-                        },
-                        enabled = !state.sending && input.isNotBlank()
-                    ) {
-                        Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "发送")
-                    }
+                    Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "发送")
                 }
             }
 
@@ -784,6 +826,39 @@ fun ChatScreen(mainVm: MainViewModel) {
                         actionMessage = null
                     }
                 }
+                // 回退（revert）：面向已投递的消息，删除该消息之后的所有内容。
+                // 与上面的撤回不同：撤回只对尚未投递的输入有效。
+                if (message != null && message.id !in state.pendingInputs && !message.id.startsWith("local-")) {
+                    if (state.reverting) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 10.dp),
+                            horizontalArrangement = Arrangement.Center,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(16.dp),
+                                strokeWidth = 2.dp
+                            )
+                            Spacer(Modifier.width(8.dp))
+                            Text(
+                                text = "正在回退…",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    } else {
+                        SheetAction("回退到这里（删除之后的内容）") {
+                            chatVm.revertTo(message.id, restoreFiles = false)
+                            actionMessage = null
+                        }
+                        SheetAction("回退到这里（含文件还原）") {
+                            chatVm.revertTo(message.id, restoreFiles = true)
+                            actionMessage = null
+                        }
+                    }
+                }
             }
         }
     }
@@ -1020,6 +1095,7 @@ private fun MessageBubble(
     message: ChatMessage,
     onLongPress: () -> Unit,
     streaming: Boolean = false,
+    pendingDelivery: String? = null,
 ) {
     if (message.role == "user") {
         Row(
@@ -1060,18 +1136,35 @@ private fun MessageBubble(
                     Spacer(Modifier.height(4.dp))
                 }
                 if (message.blocks.isNotEmpty()) {
-                    Surface(
-                        color = MaterialTheme.colorScheme.primaryContainer,
-                        shape = MaterialTheme.shapes.medium,
-                        modifier = Modifier
-                            .widthIn(max = 300.dp)
-                            .combinedClickable(onClick = {}, onLongClick = onLongPress)
-                    ) {
-                        Text(
-                            text = message.textContent(),
-                            modifier = Modifier.padding(10.dp),
-                            style = MaterialTheme.typography.bodyMedium
-                        )
+                    Column(horizontalAlignment = Alignment.End) {
+                        Surface(
+                            color = MaterialTheme.colorScheme.primaryContainer,
+                            shape = MaterialTheme.shapes.medium,
+                            modifier = Modifier
+                                .widthIn(max = 300.dp)
+                                .combinedClickable(onClick = {}, onLongClick = onLongPress)
+                        ) {
+                            Text(
+                                text = message.textContent(),
+                                modifier = Modifier.padding(10.dp),
+                                style = MaterialTheme.typography.bodyMedium
+                            )
+                        }
+                        // 待投递标记：让用户知道这条输入是"将插入"还是"已排队"
+                        if (pendingDelivery != null) {
+                            Surface(
+                                color = MaterialTheme.colorScheme.tertiary.copy(alpha = 0.18f),
+                                shape = MaterialTheme.shapes.extraSmall,
+                                modifier = Modifier.padding(top = 2.dp)
+                            ) {
+                                Text(
+                                    text = if (pendingDelivery == "queue") "已排队" else "将插入",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.tertiary,
+                                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 1.dp)
+                                )
+                            }
+                        }
                     }
                 }
             }

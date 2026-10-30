@@ -79,6 +79,8 @@ data class ChatUiState(
     val mcpServers: List<McpServerInfo> = emptyList(),
     /** 正在重连的 MCP 服务器名。 */
     val reconnectingMcp: String? = null,
+    /** 正在执行回退（revert）。 */
+    val reverting: Boolean = false,
 )
 
 /**
@@ -143,7 +145,31 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         _ui.value = ChatUiState()
         viewModelScope.launch { loadHistory() }
         viewModelScope.launch { loadPickerData() }
+        // 切换会话后恢复执行状态：新实例不知道服务器端是否仍在跑，
+        // 若不同步，停止按钮会消失（但任务其实还在继续）
+        syncStreamingState()
+        syncInbox()
         startStream()
+    }
+
+    /** 从服务器同步当前会话是否正在执行（GET /api/session/active）。 */
+    private fun syncStreamingState() {
+        val s = server ?: return
+        val sid = sessionID ?: return
+        viewModelScope.launch {
+            api.activeSessions(s).onSuccess { map ->
+                val running = map[sid] == "running"
+                _ui.update { it.copy(streaming = running) }
+                // 兜底：若在查询与 SSE 建立之间任务已结束，会错过 execution.succeeded
+                // 事件导致停止按钮一直挂着，延迟复查一次
+                if (running) {
+                    delay(5000)
+                    api.activeSessions(s).onSuccess { m2 ->
+                        _ui.update { it.copy(streaming = m2[sid] == "running") }
+                    }
+                }
+            }
+        }
     }
 
     fun stop() {
@@ -473,6 +499,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     private fun refreshRecent() {
         val s = server ?: return
         val sid = sessionID ?: return
+        syncInbox()
         viewModelScope.launch {
             api.recentMessages(s, sid).onSuccess { recent ->
                 if (recent.isEmpty()) return@onSuccess
@@ -541,6 +568,50 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             api.mcpServers(s).onSuccess { servers ->
                 _ui.update { it.copy(mcpServers = servers) }
             }
+        }
+    }
+
+    /** 同步待投递输入（启动/刷新时调用，保证重启后长按撤回依然可用）。 */
+    fun syncInbox() {
+        val s = server ?: return
+        val sid = sessionID ?: return
+        viewModelScope.launch {
+            api.inboxList(s, sid).onSuccess { items ->
+                pendingUser.clear()
+                pendingDelivery.clear()
+                items.forEach { item ->
+                    pendingUser[item.id] = item.text
+                    pendingDelivery[item.id] = item.delivery
+                }
+                publish()
+            }
+        }
+    }
+
+    /**
+     * 回退到指定消息（Web 的 revert）。
+     *
+     * 与 inbox 撤回不同：revert 面向已投递的消息，删除该消息之后的所有内容；
+     * restoreFiles=true 时同时把文件改动还原到当时的快照。
+     */
+    fun revertTo(messageID: String, restoreFiles: Boolean) {
+        val s = server ?: return
+        val sid = sessionID ?: return
+        _ui.update { it.copy(reverting = true, error = null) }
+        viewModelScope.launch {
+            api.revertStage(s, sid, messageID, restoreFiles)
+                .onSuccess { api.revertCommit(s, sid) }
+                .onSuccess {
+                    _ui.update { it.copy(reverting = false, error = null) }
+                    // 回退会改动历史与文件，必须全量重载
+                    loadHistory()
+                    syncInbox()
+                }
+                .onFailure { e ->
+                    // 失败时清掉暂存，避免留下半成品状态
+                    api.revertClear(s, sid)
+                    _ui.update { it.copy(reverting = false, error = "回退失败：${e.message}") }
+                }
         }
     }
 
@@ -665,6 +736,14 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 // 否则正文会覆盖思考块（表现为"思考完折叠块直接消失"，刷新后才又出现）
                 val key = if (isReasoning) "r:$ordinal" else "t:$ordinal"
                 val kind = if (isReasoning) "reasoning" else "text"
+                if (isReasoning) {
+                    // started 事件偶尔缺失，导致思考耗时一直空白（卡住）；
+                    // 用首个 delta 兜底记录起点，与服务器 part.time.created 基本一致
+                    reasoningStart.putIfAbsent(
+                        "$mid:$ordinal",
+                        event.created ?: System.currentTimeMillis(),
+                    )
+                }
                 upsertBlock(mid, key) { existing ->
                     (existing as? Block.Text)?.copy(text = existing.text + delta)
                         ?: Block.Text(kind, delta, ordinal)
@@ -684,11 +763,20 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             "session.tool.input.started" -> {
                 val mid = data.str("assistantMessageID") ?: return
                 val callId = data.str("id") ?: return
-                toolStart[callId] = event.created ?: System.currentTimeMillis()
+                // 兜底起点：真正的锚点在 tool.called（对应服务器 part.time.ran）
+                toolStart.putIfAbsent(callId, event.created ?: System.currentTimeMillis())
                 upsertBlock(mid, "c:$callId") { existing ->
-                    (existing as? Block.Tool)?.call?.copy(name = data.str("name") ?: existing.call.name)
-                        ?.let { Block.Tool(it) }
-                        ?: Block.Tool(ToolCall(callId, data.str("name") ?: "tool", "running"))
+                    val cur = (existing as? Block.Tool)?.call
+                    when {
+                        cur == null ->
+                            Block.Tool(ToolCall(callId, data.str("name") ?: "tool", "running"))
+                        // 已识别出 MCP 工具名的不回退：started 事件偶尔晚到，
+                        // 会把已经显示的 mcp + 工具名覆盖回 execute（刷新前一直错）
+                        cur.name == "mcp" || cur.title != null -> Block.Tool(cur)
+                        else -> Block.Tool(
+                            cur.copy(name = data.str("name") ?: cur.name, state = "running")
+                        )
+                    }
                 }
                 publish()
             }
@@ -738,7 +826,9 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 val mid = data.str("assistantMessageID") ?: return
                 val callId = data.str("id") ?: return
                 val inputObj = data["input"] as? JsonObject
-                toolStart.putIfAbsent(callId, event.created ?: System.currentTimeMillis())
+                // 计时锚点：called 对应服务器 part.time.ran（输入流式传输已完成），
+                // 覆盖 input.started 的临时起点，让实时耗时与刷新后的历史耗时一致
+                toolStart[callId] = event.created ?: System.currentTimeMillis()
                 val declared = data.str("name")
                 val mcpTool = if (declared == "execute") extractMcpToolName(inputObj) else null
                 upsertTool(mid, callId) {
@@ -798,7 +888,10 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             "session.reasoning.started" -> {
                 val mid = data.str("assistantMessageID") ?: return
                 val ordinal = (data["ordinal"] as? JsonPrimitive)?.content?.toIntOrNull() ?: 0
-                reasoningStart["$mid:$ordinal"] = event.created ?: System.currentTimeMillis()
+                reasoningStart.putIfAbsent(
+                    "$mid:$ordinal",
+                    event.created ?: System.currentTimeMillis(),
+                )
             }
             "session.reasoning.ended" -> {
                 val mid = data.str("assistantMessageID") ?: return
@@ -886,12 +979,15 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 synchronized(lastShellCall) { lastShellCallMid[callId] = mid }
             }
             "session.inbox.enqueued" -> {
-                val inboxID = data.str("inboxID") ?: return
-                val item = data["item"] as? JsonObject ?: return
+                // 事件结构可能是 {inboxID, item} 也可能直接就是 Inbox.Item 本身，
+                // 两种都兼容，避免字段名不匹配时漏处理（表现为长按只有复制、无法撤回）
+                val item = (data["item"] as? JsonObject) ?: data
+                val inboxID = data.str("inboxID") ?: item.str("id") ?: return
                 if (item.str("type") != "user") return
                 val text = ((item["payload"] as? JsonObject)?.get("text") as? JsonPrimitive)?.content ?: return
                 pendingUser[inboxID] = text
-                pendingDelivery[inboxID] = data.str("delivery") ?: "steer"
+                pendingDelivery[inboxID] = data.str("delivery")
+                    ?: item.str("delivery") ?: "steer"
                 // 撤下乐观气泡（文本匹配的第一条 local-）
                 _ui.update { st ->
                     val idx = st.messages.indexOfFirst {

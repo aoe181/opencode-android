@@ -16,7 +16,8 @@ private val Context.dataStore by preferencesDataStore(name = "opencode_settings"
 /** 每个会话的本地状态（草稿、滚动位置），合并成一个 JSON 键以减少 DataStore 读写开销。 */
 data class SessionLocalState(
     val drafts: Map<String, String> = emptyMap(),
-    val scrolls: Map<String, Int> = emptyMap(),
+    /** 会话滚动锚点：sessionID -> "消息id:偏移"。按 id 而非索引，历史分页后索引会漂移。 */
+    val scrolls: Map<String, String> = emptyMap(),
 )
 
 /** 本地设置与服务器连接信息持久化（DataStore Preferences）。 */
@@ -87,7 +88,7 @@ class SettingsStore(private val context: Context) {
                 (it.value as? JsonPrimitive)?.content.orEmpty()
             }.orEmpty()
             val scrolls = (root["scrolls"] as? JsonObject)?.mapValues {
-                (it.value as? JsonPrimitive)?.content?.toIntOrNull() ?: 0
+                (it.value as? JsonPrimitive)?.content.orEmpty()
             }.orEmpty()
             SessionLocalState(drafts, scrolls)
         }.getOrElse { SessionLocalState() }
