@@ -21,6 +21,19 @@ sealed class Block {
     data class Tool(val call: ToolCall) : Block()
 }
 
+/**
+ * 压缩记录（服务器 type="compaction" 消息）。
+ *
+ * 摘要由服务器生成并自动注入后续对话上下文（包成 <conversation-checkpoint>），
+ * App 只负责展示，不参与注入。
+ */
+data class CompactionInfo(
+    val summary: String,
+    val reason: String? = null,
+    val status: String = "completed",
+    val keptMessages: Int? = null,
+)
+
 data class ToolFileChange(
     val file: String,
     val patch: String,
@@ -53,6 +66,8 @@ data class ChatMessage(
     val images: List<MessageImage> = emptyList(), // user 消息附带的图片（内联 base64）
     val attachments: List<MessageAttachment> = emptyList(), // 路径引用的附件（Web 的 metadata.attachments）
     val timestampMs: Long? = null, // 消息创建时间（长按面板显示）
+    /** 压缩摘要（type=compaction 消息）：非空时渲染为可折叠的压缩卡片。 */
+    val compaction: CompactionInfo? = null,
 ) {
     fun textContent(): String =
         blocks.filterIsInstance<Block.Text>()
@@ -458,6 +473,25 @@ fun parseMessages(body: String): List<ChatMessage> {
         val id = obj.str("id") ?: return@mapNotNull null
         val type = obj.str("type") ?: "assistant"
 
+        // 压缩记录：服务器生成摘要并自动注入后续对话，这里只做展示（可折叠卡片）
+        if (type == "compaction") {
+            val status = obj.str("status") ?: "completed"
+            val summary = obj.str("summary").orEmpty()
+            if (status != "completed" || summary.isBlank()) return@mapNotNull null
+            return@mapNotNull ChatMessage(
+                id = id,
+                role = "system",
+                blocks = emptyList(),
+                timestampMs = (obj["time"] as? JsonObject)?.num("created"),
+                compaction = CompactionInfo(
+                    summary = summary,
+                    reason = obj.str("reason"),
+                    status = status,
+                    keptMessages = (obj["kept"] as? JsonArray)?.size,
+                ),
+            )
+        }
+
         val blocks = mutableListOf<Block>()
 
         if (type == "user") {
@@ -665,6 +699,57 @@ data class PendingInboxItem(
     val id: String,
     val text: String,
     val delivery: String,
+)
+
+fun parseForms(body: String): List<FormDetail> = parseDataArray(body) { obj ->
+    val fields = (obj["fields"] as? JsonArray)?.mapNotNull { f ->
+        val fo = f as? JsonObject ?: return@mapNotNull null
+        val key = fo.str("key") ?: return@mapNotNull null
+        FormFieldInfo(
+            key = key,
+            title = fo.str("title"),
+            type = fo.str("type") ?: "string",
+            options = ((fo["options"] as? JsonArray)?.mapNotNull { o ->
+                (o as? JsonObject)?.let {
+                    FormOption(
+                        value = it.str("value") ?: "",
+                        label = it.str("label") ?: "",
+                        description = it.str("description"),
+                    )
+                }
+            } ?: emptyList()),
+            custom = (fo["custom"] as? JsonPrimitive)?.content == "true",
+        )
+    } ?: emptyList()
+    if (fields.isEmpty()) return@parseDataArray null
+    FormDetail(
+        id = obj.str("id") ?: return@parseDataArray null,
+        sessionID = obj.str("sessionID") ?: "",
+        title = obj.str("title") ?: "Question",
+        fields = fields,
+    )
+}
+
+/** 待回答表单（question 工具创建）。 */
+data class FormDetail(
+    val id: String,
+    val sessionID: String,
+    val title: String,
+    val fields: List<FormFieldInfo>,
+)
+
+data class FormFieldInfo(
+    val key: String,
+    val title: String?,
+    val type: String,
+    val options: List<FormOption>,
+    val custom: Boolean,
+)
+
+data class FormOption(
+    val value: String,
+    val label: String,
+    val description: String? = null,
 )
 
 fun parseInboxItems(body: String): List<PendingInboxItem> = parseDataArray(body) { obj ->

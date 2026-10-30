@@ -1,7 +1,9 @@
 package dev.opencode.client.data
 
 import kotlinx.coroutines.channels.awaitClose
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.buffer
 import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
@@ -60,5 +62,5 @@ class EventStream(private val server: RemoteServer) {
             })
 
         awaitClose { source.cancel() }
-    }
+    }.buffer(Channel.UNLIMITED)
 }

@@ -46,7 +46,9 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material3.AssistChip
+import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.RadioButton
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -404,6 +406,15 @@ fun ChatScreen(mainVm: MainViewModel) {
                     }
                 }
             }
+            }
+
+            // question 表单：agent 向用户提问（Web 同款交互：单选 + 可自由输入）
+            state.pendingForm?.let { form ->
+                QuestionFormCard(
+                    form = form,
+                    onAnswer = { values -> chatVm.answerForm(form, values) },
+                    onIgnore = { chatVm.ignoreForm(form.id) },
+                )
             }
 
             state.error?.let { err ->
@@ -778,7 +789,13 @@ fun ChatScreen(mainVm: MainViewModel) {
             ) {
                 Text(
                     text = buildString {
-                        append(if (message?.role == "user") "这条输入" else "这条回复")
+                        append(
+                            when {
+                                message?.compaction != null -> "压缩记录"
+                                message?.role == "user" -> "这条输入"
+                                else -> "这条回复"
+                            }
+                        )
                         message?.timestampMs?.let { ts ->
                             append("  ·  ")
                             append(formatTimestamp(ts))
@@ -863,6 +880,175 @@ fun ChatScreen(mainVm: MainViewModel) {
                             actionMessage = null
                         }
                     }
+                }
+            }
+        }
+    }
+}
+
+/**
+ * question 表单卡片：agent 向用户提问，选项单选或自由输入（Web 同款）。
+ *
+ * 协议：表单由 question 工具创建（GET /api/session/{id}/form 列出），
+ * 回答 POST .../form/{formID}/reply，body {"answer": {fieldKey: value}}，
+ * 值用选项 label 或自由文本（服务器把 label 原样作为回答返回给模型）。
+ */
+@Composable
+private fun QuestionFormCard(
+    form: dev.opencode.client.data.FormDetail,
+    onAnswer: (Map<String, String>) -> Unit,
+    onIgnore: () -> Unit,
+) {
+    // 多字段时逐个记录；question 工具通常只有一个字段
+    var selected by remember(form.id) { mutableStateOf<Map<String, String>>(emptyMap()) }
+    var customText by remember(form.id) { mutableStateOf("") }
+
+    Surface(
+        shape = MaterialTheme.shapes.medium,
+        color = MaterialTheme.colorScheme.surfaceVariant,
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.4f)),
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 10.dp, vertical = 2.dp)
+    ) {
+        Column(modifier = Modifier.padding(12.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    text = "❓ " + form.title,
+                    style = MaterialTheme.typography.titleSmall,
+                    color = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.weight(1f)
+                )
+            }
+            Spacer(Modifier.height(8.dp))
+            form.fields.forEach { field ->
+                Text(
+                    text = field.title ?: field.key,
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(bottom = 6.dp)
+                )
+                field.options.forEach { opt ->
+                    val isSelected = selected[field.key] == opt.label
+                    Surface(
+                        onClick = {
+                            selected = selected + (field.key to opt.label)
+                            // 选择预设选项后清空自定义输入（与 Web 一致：二者互斥）
+                            customText = ""
+                        },
+                        shape = MaterialTheme.shapes.small,
+                        color = if (isSelected) MaterialTheme.colorScheme.primaryContainer
+                                else MaterialTheme.colorScheme.surface,
+                        border = BorderStroke(
+                            1.dp,
+                            if (isSelected) MaterialTheme.colorScheme.primary
+                            else MaterialTheme.colorScheme.outlineVariant
+                        ),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 3.dp)
+                    ) {
+                        Column(modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp)) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                androidx.compose.material3.RadioButton(
+                                    selected = isSelected,
+                                    onClick = {
+                                        selected = selected + (field.key to opt.label)
+                                        customText = ""
+                                    },
+                                    modifier = Modifier.size(20.dp)
+                                )
+                                Spacer(Modifier.width(8.dp))
+                                Text(
+                                    text = opt.label,
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = MaterialTheme.colorScheme.onSurface
+                                )
+                            }
+                            opt.description?.let { desc ->
+                                Text(
+                                    text = desc,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.padding(start = 28.dp, top = 2.dp)
+                                )
+                            }
+                        }
+                    }
+                }
+                // custom=true 或无选项：提供自由输入
+                if (field.custom || field.options.isEmpty()) {
+                    Surface(
+                        shape = MaterialTheme.shapes.small,
+                        color = if (customText.isNotBlank()) MaterialTheme.colorScheme.primaryContainer
+                                else MaterialTheme.colorScheme.surface,
+                        border = BorderStroke(
+                            1.dp,
+                            if (customText.isNotBlank()) MaterialTheme.colorScheme.primary
+                            else MaterialTheme.colorScheme.outlineVariant
+                        ),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 3.dp)
+                    ) {
+                        BasicTextField(
+                            value = customText,
+                            onValueChange = { customText = it },
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 10.dp),
+                            textStyle = MaterialTheme.typography.bodyMedium.copy(
+                                color = MaterialTheme.colorScheme.onSurface
+                            ),
+                            cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
+                            maxLines = 3,
+                            decorationBox = { inner ->
+                                Box {
+                                    if (customText.isEmpty()) {
+                                        Text(
+                                            text = "或者输入自定义回答…",
+                                            style = MaterialTheme.typography.bodyMedium,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                    }
+                                    inner()
+                                }
+                            }
+                        )
+                    }
+                }
+            }
+            Spacer(Modifier.height(8.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = "忽略",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier
+                        .clickable { onIgnore() }
+                        .padding(horizontal = 10.dp, vertical = 8.dp)
+                )
+                // 可提交：每个字段都有值（选中项或自定义文本）
+                val allAnswered = form.fields.all { f ->
+                    selected[f.key]?.isNotBlank() == true ||
+                        (f.custom || f.options.isEmpty()) && customText.isNotBlank()
+                }
+                Button(
+                    onClick = {
+                        val values = selected.toMutableMap()
+                        form.fields.forEach { f ->
+                            if ((f.custom || f.options.isEmpty()) && customText.isNotBlank()) {
+                                values[f.key] = customText.trim()
+                            }
+                        }
+                        onAnswer(values)
+                    },
+                    enabled = allAnswered,
+                    contentPadding = PaddingValues(horizontal = 18.dp, vertical = 8.dp)
+                ) {
+                    Text("提交", style = MaterialTheme.typography.labelMedium)
                 }
             }
         }
@@ -1094,6 +1280,66 @@ private fun CommandHint(commands: List<CommandInfo>, onPick: (String) -> Unit) {
     }
 }
 
+/**
+ * 压缩记录卡片：默认收起，点开展示服务器生成的完整摘要。
+ *
+ * 摘要由服务器自动注入后续对话（<conversation-checkpoint>），此处纯展示，
+ * 让用户知道压缩发生了什么、保留了哪些内容。
+ */
+@Composable
+private fun CompactionCard(info: dev.opencode.client.data.CompactionInfo) {
+    var expanded by remember(info.summary.length) { mutableStateOf(false) }
+    Surface(
+        shape = MaterialTheme.shapes.small,
+        color = MaterialTheme.colorScheme.surfaceVariant,
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Column(
+            modifier = Modifier
+                .clickable { expanded = !expanded }
+                .padding(horizontal = 10.dp, vertical = 8.dp)
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    text = "⚡ 上下文已压缩",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.primary
+                )
+                info.keptMessages?.let { kept ->
+                    Spacer(Modifier.width(6.dp))
+                    Text(
+                        text = "保留 $kept 条",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                Spacer(Modifier.weight(1f))
+                Text(
+                    text = if (expanded) "收起" else "查看摘要",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Spacer(Modifier.width(4.dp))
+                Icon(
+                    if (expanded) Icons.Filled.KeyboardArrowUp else Icons.Filled.KeyboardArrowDown,
+                    contentDescription = if (expanded) "收起" else "展开",
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.size(14.dp)
+                )
+            }
+            if (expanded) {
+                Text(
+                    text = info.summary,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    modifier = Modifier.padding(top = 6.dp)
+                )
+            }
+        }
+    }
+}
+
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun MessageBubble(
@@ -1102,6 +1348,11 @@ private fun MessageBubble(
     streaming: Boolean = false,
     pendingDelivery: String? = null,
 ) {
+    // 压缩记录：可折叠卡片（默认收起，不干扰阅读）
+    message.compaction?.let { info ->
+        CompactionCard(info)
+        return
+    }
     if (message.role == "user") {
         Row(
             modifier = Modifier.fillMaxWidth(),

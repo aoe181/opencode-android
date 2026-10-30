@@ -12,6 +12,7 @@ import dev.opencode.client.data.ChatMessage
 import dev.opencode.client.data.CommandInfo
 import dev.opencode.client.data.EventStream
 import dev.opencode.client.data.FileAttachment
+import dev.opencode.client.data.FormDetail
 import dev.opencode.client.data.McpServerInfo
 import dev.opencode.client.data.ModelInfo
 import dev.opencode.client.data.ModelSelection
@@ -82,6 +83,8 @@ data class ChatUiState(
     val reconnectingMcp: String? = null,
     /** 正在执行回退（revert）。 */
     val reverting: Boolean = false,
+    /** 待回答表单（question 工具），非空时在输入行上方显示交互卡片。 */
+    val pendingForm: dev.opencode.client.data.FormDetail? = null,
 )
 
 /**
@@ -94,6 +97,8 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     private var server: RemoteServer? = null
     private var sessionID: String? = null
     private var streamJob: Job? = null
+    private var formSyncJob: Job? = null
+    private var reconcileJob: Job? = null
 
     private var history: List<ChatMessage> = emptyList()
     private var historyIds: Set<String> = emptySet()
@@ -150,7 +155,24 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         // 若不同步，停止按钮会消失（但任务其实还在继续）
         syncStreamingState()
         syncInbox()
+        syncForms()
         startStream()
+        startPeriodicReconcile()
+    }
+
+    /**
+     * 周期性对账：SSE 偶发丢帧（缓冲溢出）会让 live 卡片停在转圈。
+     * 流式期间每 8 秒拉一次最新一页，按服务器历史修正状态；
+     * 非流式时不跑（没有转圈卡片）。
+     */
+    private fun startPeriodicReconcile() {
+        reconcileJob?.cancel()
+        reconcileJob = viewModelScope.launch {
+            while (isActive) {
+                delay(8000)
+                if (_ui.value.streaming) refreshRecent()
+            }
+        }
     }
 
     /** 从服务器同步当前会话是否正在执行（GET /api/session/active）。 */
@@ -176,6 +198,10 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     fun stop() {
         streamJob?.cancel()
         streamJob = null
+        formSyncJob?.cancel()
+        formSyncJob = null
+        reconcileJob?.cancel()
+        reconcileJob = null
         sessionID = null
     }
 
@@ -510,6 +536,28 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 history = head + recent
                 historyIds = history.map { it.id }.toSet()
                 liveBlocks.keys.removeAll(historyIds)
+                // 最终防线：SSE 偶发丢帧时，live 卡片可能停在转圈状态；
+                // 服务器历史里该工具已是终态的话，按历史修正
+                liveBlocks.forEach { (mid, blocks) ->
+                    val serverMsg = recent.firstOrNull { it.id == mid } ?: return@forEach
+                    blocks.forEach { (key, block) ->
+                        if (!key.startsWith("c:")) return@forEach
+                        val live = block as? Block.Tool ?: return@forEach
+                        val callId = live.call.id
+                        val serverTool = serverMsg.blocks.filterIsInstance<Block.Tool>()
+                            .firstOrNull { it.call.id == callId } ?: return@forEach
+                        if (live.call.state == "running" && serverTool.call.state != "running") {
+                            blocks[key] = Block.Tool(
+                                live.call.copy(
+                                    state = serverTool.call.state,
+                                    output = serverTool.call.output ?: live.call.output,
+                                    durationMs = live.call.durationMs ?: serverTool.call.durationMs,
+                                    exit = serverTool.call.exit ?: live.call.exit,
+                                )
+                            )
+                        }
+                    }
+                }
                 publish()
             }
         }
@@ -586,6 +634,71 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 }
                 publish()
             }
+        }
+    }
+
+    /** 同步待回答表单（question 工具）。 answered/cancelled 的表单不会出现在列表里，自动清除。 */
+    fun syncForms() {
+        val s = server ?: return
+        val sid = sessionID ?: return
+        viewModelScope.launch {
+            api.pendingForms(s, sid).onSuccess { list ->
+                _ui.update { it.copy(pendingForm = list.firstOrNull()) }
+            }
+        }
+    }
+
+    /**
+     * question 工具执行后才创建表单，事件到达时表单可能还没就绪，
+     * 轮询几次直到拿到 pending 表单。
+     */
+    fun scheduleFormSync() {
+        formSyncJob?.cancel()
+        formSyncJob = viewModelScope.launch {
+            val s = server ?: return@launch
+            val sid = sessionID ?: return@launch
+            repeat(5) {
+                delay(600)
+                val list = api.pendingForms(s, sid).getOrNull()
+                if (!list.isNullOrEmpty()) {
+                    _ui.update { it.copy(pendingForm = list.firstOrNull()) }
+                    return@launch
+                }
+            }
+        }
+    }
+
+    /** 提交回答：key -> 值（选项 label 或自由文本）。 */
+    fun answerForm(form: FormDetail, values: Map<String, String>) {
+        val s = server ?: return
+        val sid = sessionID ?: return
+        // 乐观收起卡片；失败时下次 syncForms 会重新拉回来
+        _ui.update { it.copy(pendingForm = null) }
+        viewModelScope.launch {
+            api.replyForm(s, sid, form.id, values)
+                .onSuccess {
+                    syncInbox()
+                    refreshRecent()
+                }
+                .onFailure { e ->
+                    _ui.update { it.copy(error = "提交失败：${e.message}") }
+                    syncForms()
+                }
+        }
+    }
+
+    /** 忽略表单（question 工具收到"已取消"）。 */
+    fun ignoreForm(formID: String) {
+        val s = server ?: return
+        val sid = sessionID ?: return
+        _ui.update { it.copy(pendingForm = null) }
+        viewModelScope.launch {
+            api.cancelForm(s, sid, formID)
+                .onSuccess { refreshRecent() }
+                .onFailure { e ->
+                    _ui.update { it.copy(error = "忽略失败：${e.message}") }
+                    syncForms()
+                }
         }
     }
 
@@ -820,6 +933,9 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 // 计时锚点：called 对应服务器 part.time.ran（输入流式传输已完成），
                 // 覆盖 input.started 的临时起点，让实时耗时与刷新后的历史耗时一致
                 toolStart[callId] = event.created ?: System.currentTimeMillis()
+                // question 工具：表单要等工具真正执行时才创建，called 时立即轮询，
+                // 待表单就绪后弹出交互卡片（Web 同款体验）
+                if (data.str("name") == "question") scheduleFormSync()
                 val declared = data.str("name")
                 val mcpTool = if (declared == "execute") extractMcpToolName(inputObj) else null
                 upsertTool(mid, callId) {
@@ -978,10 +1094,23 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 // 是服务器给的，比从 input.code 跑正则可靠。卡片此时若已存在则原地修正，
                 // 不存在则在此创建（进度事件意味着输入已完整，不会再闪 execute）
                 val display = toolDisplayFromMetadata(metadata)
-                if (display != null) {
+                // progress.toolCalls[].status=completed 说明工具已执行完（success 事件
+                // 可能因 SSE 缓冲溢出丢失，这里作为兜底完成信号，避免卡片永远转圈）
+                val allCompleted = (metadata?.get("toolCalls") as? JsonArray)
+                    ?.all { (it as? JsonObject)?.str("status") == "completed" } == true
+                if (display != null || allCompleted) {
                     upsertTool(mid, callId) { cur ->
                         // 已识别的不回退；并发多工具时保留 "第一个 +N" 标题
-                        cur.copy(name = display.first, title = display.second)
+                        cur.copy(
+                            name = display?.first ?: cur.name,
+                            title = display?.second ?: cur.title,
+                            state = if (allCompleted && !cur.background) "success" else cur.state,
+                            durationMs = if (allCompleted && cur.durationMs == null) {
+                                toolStart[callId]?.let { start ->
+                                    (event.created ?: System.currentTimeMillis()) - start
+                                }.takeIf { it != null && it >= 0 } ?: cur.durationMs
+                            } else cur.durationMs,
+                        )
                     }
                     publish()
                 }
@@ -1028,6 +1157,27 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             "session.execution.interrupted" -> {
                 // interrupted：用户点停止后服务器的收尾事件，必须复位 streaming
                 _ui.update { it.copy(streaming = false) }
+                // 兜底：任务已结束，所有仍在转圈的 live 卡片收尾（success 事件可能丢失）
+                liveBlocks.values.forEach { blocks ->
+                    blocks.forEach { (key, block) ->
+                        if (key.startsWith("c:")) {
+                            (block as? Block.Tool)?.let { tb ->
+                                if (tb.call.state == "running") {
+                                    blocks[key] = Block.Tool(
+                                        tb.call.copy(
+                                            state = if (tb.call.background) "running" else "success",
+                                            durationMs = tb.call.durationMs
+                                                ?: toolStart[tb.call.id]?.let { start ->
+                                                    (event.created ?: System.currentTimeMillis()) - start
+                                                }?.takeIf { it >= 0 },
+                                        )
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+                publish()
                 refreshRecent()
                 loadSessionDetail()
             }
@@ -1037,6 +1187,8 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             }
             "session.compaction.ended" -> {
                 _ui.update { it.copy(compacting = false) }
+                // 压缩结果以服务器生成的 compaction 消息（摘要卡片）出现在内容流里，
+                // loadHistory 拉到后自动渲染，无需本地提示
                 loadHistory()
                 loadSessionDetail()
             }
@@ -1151,10 +1303,26 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         val pending = pendingUser.map { (id, text) ->
             ChatMessage(id, "user", listOf(Block.Text("text", text, 0)))
         }
+        // 性能：history 是常量（只有 loadHistory/refreshRecent 才变），
+        // 流式期间每 32ms 重建整个列表 + distinctBy 在千条会话上开销很大。
+        // 改为：历史只在变化时缓存拼接结果，流式期间只拼 live + pending。
+        val combined = if (live.isEmpty() && pending.isEmpty()) {
+            history
+        } else {
+            // 历史已保证 id 唯一；live/pending 是少量条目，只对它们去重即可
+            val liveIds = HashSet<String>(live.size + pending.size)
+            val merged = ArrayList<ChatMessage>(history.size + live.size + pending.size)
+            merged.addAll(history)
+            for (m in live) if (liveIds.add(m.id)) merged.add(m)
+            for (m in pending) if (liveIds.add(m.id)) merged.add(m)
+            // 迟到事件可能带历史里已有的 id：过滤掉重复的历史项
+            if (merged.size != history.size + live.size + pending.size) {
+                merged.distinctBy { it.id }
+            } else merged
+        }
         _ui.update {
-            // distinctBy 兜底：任何来源的重复 id 都不允许进列表（LazyColumn key 崩溃防护）
             it.copy(
-                messages = (history + live + pending).distinctBy { m -> m.id },
+                messages = combined,
                 // 让长按面板能识别"尚未投递"的输入，从而提供撤回/插队
                 pendingInputs = pendingUser.toMap(),
                 pendingDeliveries = pendingDelivery.toMap(),

@@ -149,6 +149,17 @@ fun ToolCallCard(call: ToolCall) {
                         }
                         ToolSection("输出", call.output)
                     }
+                    // question：展开态显示人类可读的问题与选项，而非原始 JSON
+                    call.name == "question" -> {
+                        val q = questionSummary(call.input)
+                        if (q != null) {
+                            ToolSection("问题", q.first)
+                            if (q.second.isNotBlank()) ToolSection("选项", q.second)
+                        } else {
+                            ToolSection("参数", call.input)
+                        }
+                        ToolSection("结果", call.output)
+                    }
                     // MCP / code mode：代码通常很长，默认只显示输出，输入代码折叠到更矮的高度
                     call.name == "mcp" -> {
                         ToolSection("输出", call.output)
@@ -301,4 +312,38 @@ private fun highlightedCode(content: String): androidx.compose.ui.text.Annotated
             )
         }
     }
+}
+
+/**
+ * 把 question 工具的输入 JSON 转成人类可读的（问题, 选项列表）。
+ *
+ * 输入形如 {"questions":[{"header":"…","question":"…","options":[{"label":"…","description":"…"}]}]}，
+ * 展开态直接显示 JSON 可读性很差，这里抽取标题/问题/选项。
+ */
+private fun questionSummary(input: String?): Pair<String, String>? {
+    if (input.isNullOrBlank()) return null
+    val obj = runCatching {
+        kotlinx.serialization.json.Json { ignoreUnknownKeys = true }
+            .parseToJsonElement(input) as? kotlinx.serialization.json.JsonObject
+    }.getOrNull() ?: return null
+    val questions = obj["questions"] as? kotlinx.serialization.json.JsonArray ?: return null
+    val sb = StringBuilder()
+    val opts = StringBuilder()
+    questions.forEachIndexed { i, el ->
+        val q = el as? kotlinx.serialization.json.JsonObject ?: return@forEachIndexed
+        val header = (q["header"] as? kotlinx.serialization.json.JsonPrimitive)?.content
+        val text = (q["question"] as? kotlinx.serialization.json.JsonPrimitive)?.content
+        if (i > 0) sb.append("\n\n")
+        header?.takeIf { it.isNotBlank() }?.let { sb.append("【").append(it).append("】\n") }
+        sb.append(text.orEmpty())
+        (q["options"] as? kotlinx.serialization.json.JsonArray)?.forEach { o ->
+            val oo = o as? kotlinx.serialization.json.JsonObject ?: return@forEach
+            val label = (oo["label"] as? kotlinx.serialization.json.JsonPrimitive)?.content ?: return@forEach
+            val desc = (oo["description"] as? kotlinx.serialization.json.JsonPrimitive)?.content
+            if (opts.isNotEmpty()) opts.append('\n')
+            opts.append("• ").append(label)
+            desc?.takeIf { it.isNotBlank() }?.let { opts.append(" — ").append(it) }
+        }
+    }
+    return if (sb.isEmpty()) null else sb.toString() to opts.toString()
 }

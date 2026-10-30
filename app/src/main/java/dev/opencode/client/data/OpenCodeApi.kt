@@ -257,6 +257,33 @@ class OpenCodeApi {
     suspend fun inboxList(server: RemoteServer, sessionID: String): Result<List<PendingInboxItem>> =
         get(server, "/api/session/$sessionID/inbox").mapCatching(::parseInboxItems)
 
+    /** 会话当前待回答的表单（question 工具创建）。 */
+    suspend fun pendingForms(server: RemoteServer, sessionID: String): Result<List<FormDetail>> =
+        get(server, "/api/session/$sessionID/form").mapCatching(::parseForms)
+
+    /** 回答表单：key -> 值（选项 label 或自由文本）。 */
+    suspend fun replyForm(
+        server: RemoteServer,
+        sessionID: String,
+        formID: String,
+        answer: Map<String, String>,
+    ): Result<Unit> {
+        val answerObj = JsonObject(answer.mapValues { JsonPrimitive(it.value) })
+        val body = JsonObject(mapOf("answer" to answerObj)).toString()
+        return post(server, "/api/session/$sessionID/form/$formID/reply", body).map { }
+    }
+
+    /** 忽略（取消）表单：question 工具会收到"已取消"。 */
+    suspend fun cancelForm(server: RemoteServer, sessionID: String, formID: String): Result<Unit> =
+        withContext(Dispatchers.IO) {
+            runCatching {
+                client.newCall(request(server, "/api/session/$sessionID/form/$formID").delete().build())
+                    .execute().use { resp ->
+                        if (!resp.isSuccessful) error("HTTP ${resp.code}")
+                    }
+            }
+        }
+
     /** 当前正在执行任务的会话：sessionId -> 状态类型（running 等）。用于切换会话后恢复停止按钮。 */
     suspend fun activeSessions(server: RemoteServer): Result<Map<String, String>> =
         get(server, "/api/session/active").mapCatching { body ->

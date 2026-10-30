@@ -29,10 +29,10 @@ fun MarkdownText(
 ) {
     val context = LocalContext.current
     val dark = LocalAppDarkTheme.current
-    val markwon = remember(context, dark) { buildMarkwon(context, dark, withTables = true) }
+    val markwon = remember(context, dark) { cachedMarkwon(context, dark, withTables = true) }
     // 流式期间禁用表格插件：TablePlugin 每次都要重算列宽/单元格背景，
     // 文本每增长一行就整表重排，视觉上就是"闪"。降级为纯文本后列宽不再变化。
-    val markwonNoTables = remember(context, dark) { buildMarkwon(context, dark, withTables = false) }
+    val markwonNoTables = remember(context, dark) { cachedMarkwon(context, dark, withTables = false) }
     val hasTable = remember(markdown) { looksLikeTable(markdown) }
     val usePlain = streaming && hasTable
     AndroidView(
@@ -64,7 +64,20 @@ fun MarkdownText(
     )
 }
 
-/** 构造 Markwon；withTables=false 时不装表格插件（流式降级用）。 */
+/**
+ * Markwon 实例缓存（全应用共享）。
+ *
+ * 每条消息的 MarkdownText 之前各自 remember 建两个 Markwon（含表格/无表格），
+ * 长会话里可见的十几条消息就是二十多个实例，每个都带完整插件链。
+ * Markwon 是无状态的解析器，可以安全共享，这里按 (dark, withTables) 缓存。
+ */
+private val markwonCache = HashMap<String, Markwon>()
+
+private fun cachedMarkwon(context: android.content.Context, dark: Boolean, withTables: Boolean): Markwon {
+    val key = "$dark-$withTables"
+    return markwonCache.getOrPut(key) { buildMarkwon(context, dark, withTables) }
+}
+
 private fun buildMarkwon(
     context: android.content.Context,
     dark: Boolean,
