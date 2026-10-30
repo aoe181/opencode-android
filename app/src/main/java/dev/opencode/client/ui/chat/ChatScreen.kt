@@ -899,9 +899,9 @@ private fun QuestionFormCard(
     onAnswer: (Map<String, String>) -> Unit,
     onIgnore: () -> Unit,
 ) {
-    // 多字段时逐个记录；question 工具通常只有一个字段
+    // 选中项与自定义输入都按字段 key 存储，多字段表单不会互相串
     var selected by remember(form.id) { mutableStateOf<Map<String, String>>(emptyMap()) }
-    var customText by remember(form.id) { mutableStateOf("") }
+    var customTexts by remember(form.id) { mutableStateOf<Map<String, String>>(emptyMap()) }
 
     Surface(
         shape = MaterialTheme.shapes.medium,
@@ -933,8 +933,8 @@ private fun QuestionFormCard(
                     Surface(
                         onClick = {
                             selected = selected + (field.key to opt.label)
-                            // 选择预设选项后清空自定义输入（与 Web 一致：二者互斥）
-                            customText = ""
+                            // 选择预设选项后清空该字段的自定义输入（二者互斥）
+                            customTexts = customTexts - field.key
                         },
                         shape = MaterialTheme.shapes.small,
                         color = if (isSelected) MaterialTheme.colorScheme.primaryContainer
@@ -954,7 +954,7 @@ private fun QuestionFormCard(
                                     selected = isSelected,
                                     onClick = {
                                         selected = selected + (field.key to opt.label)
-                                        customText = ""
+                                        customTexts = customTexts - field.key
                                     },
                                     modifier = Modifier.size(20.dp)
                                 )
@@ -976,8 +976,9 @@ private fun QuestionFormCard(
                         }
                     }
                 }
-                // custom=true 或无选项：提供自由输入
+                // custom=true 或无选项：提供自由输入（按字段 key 独立存储）
                 if (field.custom || field.options.isEmpty()) {
+                    val customText = customTexts[field.key].orEmpty()
                     Surface(
                         shape = MaterialTheme.shapes.small,
                         color = if (customText.isNotBlank()) MaterialTheme.colorScheme.primaryContainer
@@ -993,7 +994,7 @@ private fun QuestionFormCard(
                     ) {
                         BasicTextField(
                             value = customText,
-                            onValueChange = { customText = it },
+                            onValueChange = { customTexts = customTexts + (field.key to it) },
                             modifier = Modifier.padding(horizontal = 10.dp, vertical = 10.dp),
                             textStyle = MaterialTheme.typography.bodyMedium.copy(
                                 color = MaterialTheme.colorScheme.onSurface
@@ -1033,14 +1034,15 @@ private fun QuestionFormCard(
                 // 可提交：每个字段都有值（选中项或自定义文本）
                 val allAnswered = form.fields.all { f ->
                     selected[f.key]?.isNotBlank() == true ||
-                        (f.custom || f.options.isEmpty()) && customText.isNotBlank()
+                        ((f.custom || f.options.isEmpty()) && customTexts[f.key]?.isNotBlank() == true)
                 }
                 Button(
                     onClick = {
                         val values = selected.toMutableMap()
                         form.fields.forEach { f ->
-                            if ((f.custom || f.options.isEmpty()) && customText.isNotBlank()) {
-                                values[f.key] = customText.trim()
+                            val custom = customTexts[f.key]
+                            if ((f.custom || f.options.isEmpty()) && custom?.isNotBlank() == true) {
+                                values[f.key] = custom.trim()
                             }
                         }
                         onAnswer(values)

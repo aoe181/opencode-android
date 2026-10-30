@@ -538,14 +538,14 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 liveBlocks.keys.removeAll(historyIds)
                 // 最终防线：SSE 偶发丢帧时，live 卡片可能停在转圈状态；
                 // 服务器历史里该工具已是终态的话，按历史修正
-                liveBlocks.forEach { (mid, blocks) ->
-                    val serverMsg = recent.firstOrNull { it.id == mid } ?: return@forEach
-                    blocks.forEach { (key, block) ->
-                        if (!key.startsWith("c:")) return@forEach
-                        val live = block as? Block.Tool ?: return@forEach
+                liveBlocks.forEach live@{ (mid, blocks) ->
+                    val serverMsg = recent.firstOrNull { it.id == mid } ?: return@live
+                    blocks.forEach block@{ (key, block) ->
+                        if (!key.startsWith("c:")) return@block
+                        val live = block as? Block.Tool ?: return@block
                         val callId = live.call.id
                         val serverTool = serverMsg.blocks.filterIsInstance<Block.Tool>()
-                            .firstOrNull { it.call.id == callId } ?: return@forEach
+                            .firstOrNull { it.call.id == callId } ?: return@block
                         if (live.call.state == "running" && serverTool.call.state != "running") {
                             blocks[key] = Block.Tool(
                                 live.call.copy(
